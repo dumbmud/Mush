@@ -5,6 +5,14 @@ CR_RIGHT_W = 20
 CR_SEP = "|"
 CR_LASTLINE_FREE = 2
 CR_LF = char(10)
+CR_MSG_N = 4
+
+CR_CLOCK_START_CS = 8 * 3600 * 100  // start at 08:00:00.00 (centiseconds)
+CR_CLOCK_HOURS = 8
+CR_CLOCK_MINUTES = 0
+CR_CLOCK_SECONDS = 0
+CR_CLOCK_TENTHS = 0
+CR_LAST_CLOCK_TICK = 0
 
 VIEW_W = 43
 VIEW_H = 13
@@ -261,6 +269,82 @@ cr_ckpt_delete = function()
   cr_file_delete(CR_SAVE_PATH)
 end function
 
+G_MSGS = []
+
+cr_msg_push = function(s)
+  if s == null then return
+  if s.len <= 0 then return
+  G_MSGS.push(s)
+  while G_MSGS.len > CR_MSG_N
+    G_MSGS.remove(0)
+  end while
+end function
+
+// ---------- clock ----------
+cr_2d = function(n); s = "0" + str(n); return s[-2:]; end function
+cr_fmt_clock = function(tick)
+  // 1 tick = 0.20 s = 20 cs
+  cs = CR_CLOCK_START_CS + tick * 20
+  sTot = cr_idiv(cs, 100)
+  csRem = cs - sTot * 100
+  hTot = cr_idiv(sTot, 3600)
+  h = cr_mod(hTot, 24)
+  m = cr_idiv(sTot - hTot * 3600, 60)
+  s = sTot - hTot * 3600 - m * 60
+  tenths = cr_idiv(csRem, 10)     // 0..9
+  return cr_2d(h) + ":" + cr_2d(m) + ":" + cr_2d(s) + "." + str(tenths)
+end function
+
+cr_clock_init = function(tick)
+  globals.CR_LAST_CLOCK_TICK = tick
+  total_cs = CR_CLOCK_START_CS + tick * 20
+  total_seconds = floor(total_cs / 100)
+  globals.CR_CLOCK_HOURS   = floor(total_seconds / 3600) % 24
+  remaining_seconds        = total_seconds % 3600
+  globals.CR_CLOCK_MINUTES = floor(remaining_seconds / 60)
+  globals.CR_CLOCK_SECONDS = remaining_seconds % 60
+  globals.CR_CLOCK_TENTHS  = floor((total_cs % 100) / 10)
+end function
+
+cr_clock_tick = function(tick)
+  if tick <= globals.CR_LAST_CLOCK_TICK then return
+
+  ticks_elapsed = tick - globals.CR_LAST_CLOCK_TICK
+  globals.CR_LAST_CLOCK_TICK = tick
+
+  total_new_cs      = ticks_elapsed * 20
+  total_new_seconds = floor(total_new_cs / 100)
+  new_tenths        = floor((total_new_cs % 100) / 10)
+
+  globals.CR_CLOCK_TENTHS = globals.CR_CLOCK_TENTHS + new_tenths
+  if globals.CR_CLOCK_TENTHS >= 10 then
+    extra_seconds = floor(globals.CR_CLOCK_TENTHS / 10)
+    globals.CR_CLOCK_TENTHS = globals.CR_CLOCK_TENTHS % 10
+    total_new_seconds = total_new_seconds + extra_seconds
+  end if
+
+  globals.CR_CLOCK_SECONDS = globals.CR_CLOCK_SECONDS + total_new_seconds
+  if globals.CR_CLOCK_SECONDS >= 60 then
+    extra_minutes = floor(globals.CR_CLOCK_SECONDS / 60)
+    globals.CR_CLOCK_SECONDS = globals.CR_CLOCK_SECONDS % 60
+    globals.CR_CLOCK_MINUTES = globals.CR_CLOCK_MINUTES + extra_minutes
+  end if
+
+  if globals.CR_CLOCK_MINUTES >= 60 then
+    extra_hours = floor(globals.CR_CLOCK_MINUTES / 60)
+    globals.CR_CLOCK_MINUTES = globals.CR_CLOCK_MINUTES % 60
+    globals.CR_CLOCK_HOURS   = (globals.CR_CLOCK_HOURS + extra_hours) % 24
+  end if
+end function
+
+cr_fmt_clock_fast = function()
+  h = globals.CR_CLOCK_HOURS
+  m = globals.CR_CLOCK_MINUTES
+  s = globals.CR_CLOCK_SECONDS
+  t = globals.CR_CLOCK_TENTHS
+  return cr_2d(h) + ":" + cr_2d(m) + ":" + cr_2d(s) + "." + str(t)
+end function
+
 // ---------- utils ----------
 cr_repeat = function(ch, n)
   out = ""
@@ -361,43 +445,36 @@ end function
 
 cr_status_msg_edge = function()
   g = globals
-  // fire messages only on entering a state
   if g["G_KCAL"] < 300 then
     if not g["G_S_STARVING"] then g["G_S_STARVING"] = 1; return "You are starving."
   else
     g["G_S_STARVING"] = 0
   end if
-
   if g["G_KCAL"] < 800 then
     if not g["G_S_HUNGRY"] then g["G_S_HUNGRY"] = 1; return "You are hungry."
   else
     g["G_S_HUNGRY"] = 0
   end if
-
   if g["G_WATER"] < 0.25 then
     if not g["G_S_DEHY"] then g["G_S_DEHY"] = 1; return "You are dehydrated."
   else
     g["G_S_DEHY"] = 0
   end if
-
   if g["G_WATER"] < 0.5 then
     if not g["G_S_THIRST"] then g["G_S_THIRST"] = 1; return "You are thirsty."
   else
     g["G_S_THIRST"] = 0
   end if
-
   if g["G_ALERT"] <= 20 then
     if not g["G_S_EXH"] then g["G_S_EXH"] = 1; return "You are exhausted."
   else
     g["G_S_EXH"] = 0
   end if
-
   if g["G_ALERT"] <= 40 then
     if not g["G_S_VT"] then g["G_S_VT"] = 1; return "You are very tired."
   else
     g["G_S_VT"] = 0
   end if
-
   return null
 end function
 
@@ -491,98 +568,176 @@ cr_any_enemy_visible = function(enemies, px, py)
   return 0
 end function
 
-// central time step that also advances pools and handles exhaustion skip
+// central time step that also advances pools - FIXED VERSION
 cr_do_time = function(mode, baseCost, map, enemies, px, py, tick, hp, status)
   cost = cr_cost_adj(baseCost)
 
-  // enemies act up to goal
+  // Process enemies up to the goal
   goal = tick + cost
   r = cr_enemies_process(map, enemies, px, py, goal, status)
   status = r[0]; hp = hp - r[1]; if hp < 0 then hp = 0
-  tick = goal
-
-  // pools for this step
+  if r[1] > 0 then cr_msg_push(status)
+  
+  // Process pools
   t2 = cr_pools_tick(mode, cost, hp, status)
   hp = t2[0]; status = t2[1]
+  tick = goal
 
-  // exhaustion: at alert ≤20, every 200 turns lose 1 extra idle tick
+  // Exhaustion handling - SIMPLIFIED
   if G_ALERT <= 20 then
     globals.G_ACC_EXH = G_ACC_EXH + cost
-    while G_ACC_EXH >= 200
-      // enemies advance one more tick
-      rE = cr_enemies_process(map, enemies, px, py, tick + 1, status)
+    exh_ticks = cr_idiv(G_ACC_EXH, 200)
+    if exh_ticks > 0 then
+      // Process exhaustion as a separate time step
+      rE = cr_enemies_process(map, enemies, px, py, tick + exh_ticks, status)
       status = rE[0]; hp = hp - rE[1]; if hp < 0 then hp = 0
-      tick = tick + 1
-      tE = cr_pools_tick("idle", 1, hp, status)
+      tE = cr_pools_tick("idle", exh_ticks, hp, status)
       hp = tE[0]; status = tE[1]
-      globals.G_ACC_EXH = G_ACC_EXH - 200
-    end while
+      tick = tick + exh_ticks
+      globals.G_ACC_EXH = G_ACC_EXH - exh_ticks * 200
+    end if
   end if
 
+  cr_clock_tick(tick) // update clock with the new tick
   return [tick, hp, status]
 end function
 
-// replace old cr_sleep_or_rest
-cr_sleep_or_rest = function(map, enemies, px, py, floorN, var, tick, hp, hpMax, status)
-  // SLEEP: only if tired and unseen; heals at ×2
-  if G_ALERT < 100 then
+cr_sleep_or_rest = function(map, enemies, px, py, floorN, var, tick, hp, hpMax, lvl, xp, xpNext, status)
+  CHUNK = 1500
+
+  ceil_div = function(a, b)
+    q = cr_idiv(a, b)
+    if q * b < a then return q + 1 else return q
+  end function
+
+  // ----- SLEEP -----
+  if globals.G_ALERT < 100 then
     if cr_any_enemy_visible(enemies, px, py) then
       status = "You can't sleep while visible."
+      cr_msg_push(status)
       return [tick, hp, status, 0]
     end if
-    interrupted = 0
+
     cr_draw_loading("F" + str(floorN) + var, "Sleeping...")
-    while G_ALERT < 100 and hp > 0
-      r = cr_do_time("sleep", 25, map, enemies, px, py, tick, hp, status)
+    interrupted = 0
+
+    while globals.G_ALERT < 100 and hp > 0
+      dA = SLP_A_T
+      if dA > 0 then
+        remA = cr_mod(globals.G_ACC_A, SLP_A_T)
+        dA = SLP_A_T - remA; if dA <= 0 then dA = SLP_A_T
+      end if
+
+      dR = 999999
+      if globals.G_KCAL >= HUNGER_GATE and hp < HP_MAX_DEFAULT then
+        remR = cr_mod(globals.G_ACC_REGEN, REGEN_T)
+        needR = REGEN_T - remR; if needR <= 0 then needR = REGEN_T
+        dR = ceil_div(needR, REGEN_SLEEP_X)
+      end if
+
+      dS = 999999
+      if (globals.G_KCAL <= 0 or globals.G_WATER <= 0) and STARVE_HP_T > 0 then
+        remS = cr_mod(globals.G_ACC_STARVE, STARVE_HP_T)
+        dS = STARVE_HP_T - remS; if dS <= 0 then dS = STARVE_HP_T
+      end if
+
+      dt = dA; if dR < dt then dt = dR; if dS < dt then dt = dS
+      if dt > CHUNK then dt = CHUNK
+      if dt < 1 then dt = 1
+
+      r = cr_do_time("sleep", dt, map, enemies, px, py, tick, hp, status)
       tick = r[0]; hp = r[1]; status = r[2]
+
       if hp <= 0 then break
-      if cr_any_enemy_visible(enemies, px, py) then interrupted = 1; break
+      if cr_any_enemy_visible(enemies, px, py) then
+        interrupted = 1
+        break
+      end if
     end while
+
     if hp > 0 then
-      if interrupted then status = "You wake, interrupted." else status = "You feel rested."
+      if interrupted then
+        status = "You wake, interrupted."
+      else
+        status = "You feel rested."
+      end if
+      cr_msg_push(status)
     end if
     return [tick, hp, status, 1]
   end if
 
-  // REST: alert full; idle until fully healed or no healing possible
+  // ----- REST (awake) -----
   if hp >= hpMax then
-    status = "You are fully alert."
+    status = "You are fully healed."
+    cr_msg_push(status)
     return [tick, hp, status, 0]
   end if
 
   cr_draw_loading("F" + str(floorN) + var, "Resting...")
   lastHp = hp
-  noProg = 0            // turns since last HP gain
-  CUT = 500             // stop if no healing progress over this many turns
+  noProg = 0
+  CUT = 500
 
   while hp < hpMax and hp > 0
-    r2 = cr_do_time("idle", 25, map, enemies, px, py, tick, hp, status)
+    if globals.G_ALERT < 100 then
+      status = "You feel tired."
+      cr_msg_push(status)
+      break
+    end if
+    if globals.G_KCAL < 300 then
+      status = "You are starving. You stop resting."
+      cr_msg_push(status)
+      break
+    end if
+    if globals.G_WATER < 0.25 then
+      status = "You are dehydrated. You stop resting."
+      cr_msg_push(status)
+      break
+    end if
+
+    dR = 999999
+    if globals.G_KCAL >= HUNGER_GATE and hp < HP_MAX_DEFAULT then
+      remR = cr_mod(globals.G_ACC_REGEN, REGEN_T)
+      dR = REGEN_T - remR; if dR <= 0 then dR = REGEN_T
+    end if
+    dS = 999999
+    if (globals.G_KCAL <= 0 or globals.G_WATER <= 0) and STARVE_HP_T > 0 then
+      remS = cr_mod(globals.G_ACC_STARVE, STARVE_HP_T)
+      dS = STARVE_HP_T - remS; if dS <= 0 then dS = STARVE_HP_T
+    end if
+
+    dt = dR; if dS < dt then dt = dS
+    if dt > CHUNK then dt = CHUNK
+    if dt < 1 then dt = 1
+
+    r2 = cr_do_time("idle", dt, map, enemies, px, py, tick, hp, status)
     tick = r2[0]; hp = r2[1]; status = r2[2]
     if hp <= 0 then break
 
-    // progress tracking
+    if cr_any_enemy_visible(enemies, px, py) then
+      status = "You stop resting."
+      cr_msg_push(status)
+      break
+    end if
+
     if hp > lastHp then
-      lastHp = hp
-      noProg = 0
+      lastHp = hp; noProg = 0
     else
-      noProg = noProg + 25
+      noProg = noProg + dt
       if noProg >= CUT then
         status = "You can't heal while hungry."
+        cr_msg_push(status)
         break
       end if
     end if
-
-    // optional safety: break if something wanders in; rest doesn't require unseen
-    if cr_any_enemy_visible(enemies, px, py) then
-      status = "You stop resting."
-      break
-    end if
   end while
 
-  if hp > 0 and hp >= lastHp and noProg < CUT then status = "You feel better."
+  if hp > 0 and hp == hpMax then
+    status = "You feel better."
+    cr_msg_push(status)
+  end if
   return [tick, hp, status, 1]
 end function
-
 
 cr_list_join = function(lst, sep)
   out = ""
@@ -1047,7 +1202,8 @@ cr_enemies_process = function(m, enemies, px, py, goalTick, status)
   i = 0
   while i < enemies.len
     e = enemies[i]
-    while e["t"] <= goalTick
+    // Only process if enemy needs to act before goalTick
+    if e["t"] < goalTick then
       if e["state"] == "wind" then
         if cr_adjacent(e["x"], e["y"], px, py) then
           dmg = e["dmg"]; total = total + dmg
@@ -1077,24 +1233,25 @@ cr_enemies_process = function(m, enemies, px, py, goalTick, status)
           e["state"] = "mvwind"; e["t"] = e["t"] + e["mv"]
         end if
       end if
-    end while
+    end if
     i = i + 1
   end while
   return [status, total]
 end function
 
-// ---------- render ----------
+// ---- REPLACE ----
 cr_emit_row = function(leftInner, rightInner, is_last)
   left = cr_pad(leftInner, CR_LEFT_W)
-  right = cr_pad(rightInner, CR_RIGHT_W)
-  line = left + CR_SEP + right
   if is_last == 1 then
-    print line[0:64 - CR_LASTLINE_FREE]
+    // show prompt on the last line without padding the right pane
+    print left + CR_SEP + rightInner
   else
-    print line
+    right = cr_pad(rightInner, CR_RIGHT_W)
+    print left + CR_SEP + right
     breakline
   end if
 end function
+
 
 cr_find_index = function(lst, x, y)
   i = 0
@@ -1124,7 +1281,10 @@ cr_items_near = function(items, px, py)
   return out
 end function
 
+// ---- REPLACE ----
 cr_draw = function(level, enemies, items, px, py, floorN, var, tick, hp, hpMax, lvl, xp, xpNext, statusMsg, footer)
+  drawStart = time
+  
   map = level["map"]
 
   vx = px - cr_idiv(VIEW_W - 1, 2)
@@ -1134,6 +1294,7 @@ cr_draw = function(level, enemies, items, px, py, floorN, var, tick, hp, hpMax, 
   if vx > LVL_W - VIEW_W then vx = LVL_W - VIEW_W
   if vy > LVL_H - VIEW_H then vy = LVL_H - VIEW_H
 
+  // left view
   L = []
   y = 0
   while y < VIEW_H
@@ -1160,12 +1321,24 @@ cr_draw = function(level, enemies, items, px, py, floorN, var, tick, hp, hpMax, 
     y = y + 1
   end while
 
+  // right panel header
   R = []
-  R.push("F" + str(floorN) + var + " T" + str(tick))
+  R.push("F" + str(floorN) + var + " " + cr_fmt_clock_fast())
   R.push("HP " + str(hp) + " " + cr_bar10(hp, hpMax))
-  if statusMsg == null then R.push("") else R.push(cr_pad(statusMsg, CR_RIGHT_W))
-  R.push(cr_pad(cr_items_near(items, px, py), CR_RIGHT_W))
 
+  // effect lines: +buffs / -debuffs
+  pos = []
+  neg = []
+  if G_ALERT < 100 then neg.push("-tired")
+  if G_ALERT <= 20 then neg.push("-exh")
+  if G_KCAL < 800 then neg.push("-hun")
+  if G_KCAL <= 0 then neg.push("-starve")
+  if G_WATER < 0.5 then neg.push("-thr")
+  if G_WATER < 0.25 then neg.push("-dehy")
+  R.push(cr_pad(cr_list_join(pos, " "), CR_RIGHT_W))
+  R.push(cr_pad(cr_list_join(neg, " "), CR_RIGHT_W))
+
+  // visible enemies sorted by distance
   vis = []
   i = 0
   while i < enemies.len
@@ -1187,18 +1360,53 @@ cr_draw = function(level, enemies, items, px, py, floorN, var, tick, hp, hpMax, 
     tmp = vis[a]; vis[a] = vis[mi]; vis[mi] = tmp
     a = a + 1
   end while
-  maxRows = VIEW_H - R.len
+
+  // rows available for enemies before message box and prompt
+  rowsForEnemies = VIEW_H - 2 - 2 - CR_MSG_N - 1 
   c = 0
-  while c < vis.len and c < maxRows
+  while c < vis.len and c < rowsForEnemies
     e = enemies[vis[c][1]]
     bang = ""; if e["state"] == "wind" then bang = "!"
     R.push(cr_pad(e["g"] + bang + " " + cr_bar10(e["hp"], e["max"]), CR_RIGHT_W))
     c = c + 1
   end while
-  while R.len < VIEW_H
+
+  // pad up to start of message box
+  while R.len < VIEW_H - CR_MSG_N - 1
     R.push("")
   end while
 
+  // 4-line scrolling message box (bottom-aligned until full)
+  while R.len < VIEW_H - CR_MSG_N - 1
+    R.push("")
+  end while
+
+  count = G_MSGS.len
+  visible = count
+  if visible > CR_MSG_N then visible = CR_MSG_N
+  blanks = CR_MSG_N - visible
+
+  i = 0
+  while i < blanks
+    R.push("")
+    i = i + 1
+  end while
+
+  start = count - visible
+  j = 0
+  while j < visible
+    R.push(cr_pad(G_MSGS[start + j], CR_RIGHT_W))
+    j = j + 1
+  end while
+
+
+  // prompt on the last line
+  while R.len < VIEW_H - 1
+    R.push("")
+  end while
+  R.push(":")
+
+  // draw
   clear
   i = 0
   while i < VIEW_H
@@ -1207,7 +1415,10 @@ cr_draw = function(level, enemies, items, px, py, floorN, var, tick, hp, hpMax, 
     cr_emit_row(L[i], R[i], last)
     i = i + 1
   end while
+
+  drawEnd = time
 end function
+
 
 cr_draw_loading = function(titleRight, msgCenter)
   L = []
@@ -1473,6 +1684,8 @@ verb_crawl = function(args)
     G_KCAL = 1200; G_WATER = 1.0; G_ALERT = 100
     cr_ckpt_save(life,fid,px,py,tick,hp,hpMax,lvl,xp,xpNext,enemies,items,links,used,eBy,iBy)
   end if
+  
+  cr_clock_init(tick) // initialize clock after we find out which tick we're on
 
   weap = {"name":"shiv", "cost":6, "dmg":3}
   status = ""; footer = ""
@@ -1560,15 +1773,15 @@ end if
             if enemies[i]["t"] < minT then enemies[i]["t"] = minT
             i = i + 1
           end while
-          level = {"map":map}; status = "You descend."
+          level = {"map":map}; status = "You descend."; cr_msg_push(status) 
           cr_ckpt_save(life,fid,px,py,tick,hp,hpMax,lvl,xp,xpNext,enemies,items,links,used,eBy,iBy)
           cr_draw(level, enemies, items, px, py, floorN, var, tick, hp, hpMax, lvl, xp, xpNext, status, footer)
           continue
         else
-          status = "No stairs link."
+          status = "No stairs link."; cr_msg_push(status) 
         end if
       else
-        status = "No stairs down here."
+        status = "No stairs down here."; cr_msg_push(status) 
       end if
       cr_draw(level, enemies, items, px, py, floorN, var, tick, hp, hpMax, lvl, xp, xpNext, status, footer)
       continue
@@ -1625,26 +1838,26 @@ end if
               if enemies[i]["t"] < minT then enemies[i]["t"] = minT
               i = i + 1
             end while
-            level = {"map":map}; status = "You ascend."
+            level = {"map":map}; status = "You ascend."; cr_msg_push(status) 
             cr_ckpt_save(life,fid,px,py,tick,hp,hpMax,lvl,xp,xpNext,enemies,items,links,used,eBy,iBy)
             cr_draw(level, enemies, items, px, py, floorN, var, tick, hp, hpMax, lvl, xp, xpNext, status, footer)
             continue
           else
-            status = "No stairs up link."
+            status = "No stairs up link."; cr_msg_push(status) 
           end if
         else
-          status = "No stairs up link."
+          status = "No stairs up link."; cr_msg_push(status) 
         end if
       else
-        status = "No stairs up here."
+        status = "No stairs up here."; cr_msg_push(status) 
       end if
       cr_draw(level, enemies, items, px, py, floorN, var, tick, hp, hpMax, lvl, xp, xpNext, status, footer)
       continue
     end if
 
-    // sleep or rest
+    // sleep or rest - FIXED: pass all required variables
     if key == "s" then
-      res = cr_sleep_or_rest(map, enemies, px, py, floorN, var, tick, hp, hpMax, status)
+      res = cr_sleep_or_rest(map, enemies, px, py, floorN, var, tick, hp, hpMax, lvl, xp, xpNext, status)
       tick = res[0]; hp = res[1]; status = res[2]
       cr_draw(level, enemies, items, px, py, floorN, var, tick, hp, hpMax, lvl, xp, xpNext, status, footer)
       continue
@@ -1658,6 +1871,7 @@ end if
       cr_draw(level, enemies, items, px, py, floorN, var, tick, hp, hpMax, lvl, xp, xpNext, status, footer)
       continue
     end if
+
 
     dx = mv[0]; dy = mv[1]
     if dx == 0 and dy == 0 then
@@ -1677,12 +1891,12 @@ end if
         if ei2 >= 0 and cr_adjacent(px, py, enemies[ei2]["x"], enemies[ei2]["y"]) then
           e = enemies[ei2]; dmg = weap["dmg"]; e["hp"] = e["hp"] - dmg
           if e["hp"] <= 0 then
-            enemies.remove(ei2); status = "You kill " + e["g"] + "."
+            enemies.remove(ei2); status = "You kill " + e["g"] + "."; cr_msg_push(status) 
           else
-            status = "You hit " + e["g"] + " for " + str(dmg) + "."
+            status = "You hit " + e["g"] + " for " + str(dmg) + "."; cr_msg_push(status) 
           end if
         else
-          status = "Your swing hits nothing."
+          status = "Your swing hits nothing."; cr_msg_push(status) 
         end if
         cr_draw(level, enemies, items, px, py, floorN, var, tick, hp, hpMax, lvl, xp, xpNext, status, footer)
         continue
@@ -1693,9 +1907,9 @@ end if
         tick = rM[0]; hp = rM[1]; status = rM[2]
         tx2 = px + dx; ty2 = py + dy
         if cr_is_floor(map, tx2, ty2) and cr_enemy_at(enemies, tx2, ty2) < 0 then
-          px = tx2; py = ty2; status = ""
+          px = tx2; py = ty2; status = ""; cr_msg_push(status) 
         else
-          status = "Blocked."
+          status = "Blocked."; cr_msg_push(status) 
         end if
       end if
     end if

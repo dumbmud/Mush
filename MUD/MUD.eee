@@ -6,12 +6,14 @@
 // implement pager
 // implement vfs compactor
 // tombstone delete?
+// apparently you can put a date string into the gate and im dumb, and that fixes the bug i had of not being able to dial months before oct because it'd delete the zero
 
 // first-party packs ----------------
 // doesn't cause any issues if they're missing from your file system
 // if the packs don't work, try to MANUALLY TYPE the entire include line.
 // My theory: pasting introduces hidden non-ascii that breaks the import. 
 // OH MY GOD IT'S PASTING FROM VISUAL STUDIO DOING IT IM GONNA SCREAM
+
 
 #include shell.mud
 #include dumb.mud
