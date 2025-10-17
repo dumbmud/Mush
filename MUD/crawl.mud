@@ -1930,3 +1930,9 @@ end function
 help_crawl = "start Crawl"
 help_crawl_long = "Arrows/numpad. H/V=5, diag=7. '5'=wait5, '.'=wait1. Use '>'/'<' on stairs (cost 10). Floors like F1A. Death deletes save; Q saves and quits."
 
+// --- standalone entry point ---
+if not globals.hasIndex("__CrawlStandaloneRun") then
+  globals["__CrawlStandaloneRun"] = 1
+  bgcolor(15,10,5) // dark brown
+  verb_crawl("")
+end if
