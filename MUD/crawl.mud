@@ -295,6 +295,18 @@ cr_fmt_clock = function(tick)
   return cr_2d(h) + ":" + cr_2d(m) + ":" + cr_2d(s) + "." + str(tenths)
 end function
 
+cr_fmt_dur_ticks = function(dt_ticks)
+  // 1 tick = 0.20 s = 20 centiseconds
+  total_cs = dt_ticks * 20
+  sTot = cr_idiv(total_cs, 100)
+  csRem = total_cs - sTot * 100
+  h = cr_idiv(sTot, 3600)
+  m = cr_idiv(sTot - h * 3600, 60)
+  s = sTot - h * 3600 - m * 60
+  tenths = cr_idiv(csRem, 10)
+  return cr_2d(h) + ":" + cr_2d(m) + ":" + cr_2d(s) + "." + str(tenths)
+end function
+
 cr_clock_init = function(tick)
   globals.CR_LAST_CLOCK_TICK = tick
   total_cs = CR_CLOCK_START_CS + tick * 20
@@ -621,6 +633,8 @@ cr_sleep_or_rest = function(map, enemies, px, py, floorN, var, tick, hp, hpMax, 
     cr_draw_loading("F" + str(floorN) + var, "Sleeping...")
     interrupted = 0
 
+    sleep_start = tick
+
     while globals.G_ALERT < 100 and hp > 0
       dA = SLP_A_T
       if dA > 0 then
@@ -662,6 +676,10 @@ cr_sleep_or_rest = function(map, enemies, px, py, floorN, var, tick, hp, hpMax, 
         status = "You feel rested."
       end if
       cr_msg_push(status)
+      slept_ticks = tick - sleep_start
+      if slept_ticks > 0 then
+        cr_msg_push("Slept " + cr_fmt_dur_ticks(slept_ticks) + ".")
+      end if
     end if
     return [tick, hp, status, 1]
   end if
@@ -674,6 +692,7 @@ cr_sleep_or_rest = function(map, enemies, px, py, floorN, var, tick, hp, hpMax, 
   end if
 
   cr_draw_loading("F" + str(floorN) + var, "Resting...")
+  rest_start = tick
   lastHp = hp
   noProg = 0
   CUT = 500
@@ -732,9 +751,15 @@ cr_sleep_or_rest = function(map, enemies, px, py, floorN, var, tick, hp, hpMax, 
     end if
   end while
 
-  if hp > 0 and hp == hpMax then
-    status = "You feel better."
-    cr_msg_push(status)
+  if hp > 0 then
+    if hp == hpMax then
+      status = "You feel better."
+      cr_msg_push(status)
+    end if
+    rest_ticks = tick - rest_start
+    if rest_ticks > 0 then
+      cr_msg_push("Rested for " + cr_fmt_dur_ticks(rest_ticks) + ".")
+    end if
   end if
   return [tick, hp, status, 1]
 end function
