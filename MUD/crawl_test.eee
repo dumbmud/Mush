@@ -1,0 +1,200 @@
+#include crawl.mud
+
+// crawl_test.eee — headless unit tests
+// ---- tiny harness ----
+OUT = []; TESTS = 0; FAILS = 0  // not trusted for totals; we’ll derive from OUT
+
+t_push = function(s); OUT.push(s); end function
+t_join = function(lst, sep); out=""; i=0; while i<lst.len; if i>0 then out=out+sep; out=out+lst[i]; i=i+1; end while; return out; end function
+t_line = function(s); t_push(s); end function
+
+t_reset = function()
+  globals.G_KCAL = 1200; globals.G_WATER = 1.0; globals.G_ALERT = 100
+  globals.G_ACC_K = 0; globals.G_ACC_W = 0; globals.G_ACC_A = 0
+  globals.G_ACC_REGEN = 0; globals.G_ACC_STARVE = 0
+  globals.G_S_HUNGRY = 0; globals.G_S_STARVING = 0; globals.G_S_THIRST = 0; globals.G_S_DEHY = 0; globals.G_S_VT = 0; globals.G_S_EXH = 0
+end function
+
+t_ok = function(name, cond)
+  TESTS = TESTS + 1
+  if cond then
+    t_line("[ok] " + name)
+  else
+    t_line("[FAIL] " + name)
+  end if
+end function
+
+t_eq = function(name, got, want)
+  if got == want then
+    t_ok(name + " == " + str(want), 1)
+  else
+    t_line("[FAIL] " + name + "  got=" + str(got) + " want=" + str(want))
+    FAILS = FAILS + 1; TESTS = TESTS + 0   // already counted by t_ok-style lines
+  end if
+end function
+t_near = function(name, got, want, eps)
+  if got < want - eps or got > want + eps then
+    t_line("[FAIL] " + name + "  got=" + str(got) + " want≈" + str(want))
+    FAILS = FAILS + 1
+  else
+    t_line("[ok] " + name + " ≈ " + str(want))
+  end if
+end function
+t_map_sig = function(m); return t_join(m, "|"); end function
+
+// ---- tests ----
+test_idiv_mod = function()
+  t_eq("cr_idiv 7/5", cr_idiv(7,5), 1)
+  t_eq("cr_idiv 10/5", cr_idiv(10,5), 2)
+  t_eq("cr_mod 7%5", cr_mod(7,5), 2)
+  t_eq("cr_mod 10%5", cr_mod(10,5), 0)
+end function
+
+test_bar10_bounds = function()
+  t_eq("cr_bar10 n<=0 safe", cr_bar10(1,0), "[..........]")
+  t_eq("cr_bar10 floor", cr_bar10(-5,10), "[..........]")
+  t_eq("cr_bar10 mid", cr_bar10(5,10), "[#####.....]")
+  t_eq("cr_bar10 cap", cr_bar10(500,10), "[##########]")
+end function
+
+test_rng_determinism = function()
+  life = "L20240101-0000"; fid = "L3B"
+  seed = cr_seed_for(life, fid)
+  a = cr_make_level_seeded(seed, 2, 2)
+  b = cr_make_level_seeded(seed, 2, 2)
+  sA = t_map_sig(a["map"]) + "|" + cr_xy_to_str(a["spawn"][0], a["spawn"][1]) + "|" + cr_list_to_str(a["up"]) + "|" + cr_list_to_str(a["down"])
+  sB = t_map_sig(b["map"]) + "|" + cr_xy_to_str(b["spawn"][0], b["spawn"][1]) + "|" + cr_list_to_str(b["up"]) + "|" + cr_list_to_str(b["down"])
+  t_ok("seeded gen deterministic", sA == sB)
+end function
+
+test_f1_no_ups = function()
+  life = "Lx"; fid = "L1A"
+  lvl = cr_load_level(life, fid, 4, 4)
+  t_eq("F1 up list empty", lvl["up"].len, 0)
+  m = lvl["map"]; y = 0; anyUp = 0
+  while y < LVL_H
+    x = 0
+    while x < LVL_W
+      if cr_get(m,x,y) == "<" then anyUp = 1
+      x = x + 1
+    end while
+    y = y + 1
+  end while
+  t_eq("F1 map has no '<'", anyUp, 0)
+end function
+
+test_links_pairing = function()
+  links = {}; used = {}; life = "Lx"; src = "L2A"
+  dst0 = cr_alloc_down(links, used, life, src, 0)
+  t_ok("down[0] exists", cr_links_get(links, src, "down", 0) == dst0)
+  t_ok("up[0] reciprocal", cr_links_get(links, dst0, "up", 0) == src)
+  dst1 = cr_alloc_down(links, used, life, src, 1)
+  t_ok("down[1] exists", cr_links_get(links, src, "down", 1) == dst1)
+  t_ok("up[1] reciprocal", cr_links_get(links, dst1, "up", 1) == src)
+  updst = cr_alloc_up(links, used, life, "L3A", 0)
+  t_ok("alloc_up reciprocal", updst != null and cr_links_get(links, updst, "down", 0) == "L3A")
+end function
+
+test_serialization_roundtrip = function()
+  t_reset()
+  G_KCAL = 777; G_WATER = 0.33; G_ALERT = 88
+  life = "Llife"; fid = "L4C"
+  enemies = [cr_make_enemy(10,11,"G",4), cr_make_enemy(12,13,"T",4)]
+  items = [{"x":5,"y":6,"name":"key"},{"x":7,"y":8,"name":"helm"}]
+  links = {}; used = {}; eBy = {}; iBy = {}
+  eBy[fid] = cr_enemies_to_str(enemies); iBy[fid] = cr_items_to_str(items)
+  txt = cr_ckpt_pack(life,fid,3,4,99,42,100,2,50,200,enemies,items,links,used,eBy,iBy)
+  m = cr_ckpt_unpack(txt)
+  t_eq("ckpt fid", m["fid"], fid)
+  t_ok("ckpt enemies decode", cr_enemies_to_str(m["enemies"]) == cr_enemies_to_str(enemies))
+  t_ok("ckpt items decode", cr_items_to_str(m["items"]) == cr_items_to_str(items))
+  t_eq("ckpt pools kcal", G_KCAL, 777)
+  t_eq("ckpt pools water", G_WATER, 0.33)
+  t_eq("ckpt pools alert", G_ALERT, 88)
+end function
+
+test_pools_tick = function()
+  t_reset(); hp = 50
+  cr_pools_tick("idle", 225, hp, ""); t_eq("kcal -1 per 225 idle", globals.G_KCAL, 1199)
+  t_reset(); hp = 50
+  cr_pools_tick("idle", 1800, hp, ""); t_near("water -0.01 per 1800 idle", globals.G_WATER, 0.99, 0.0005)
+  t_reset(); globals.G_ALERT = 40
+  cr_pools_tick("sleep", 1440, 50, ""); t_eq("alert +1 per 1440 sleep", globals.G_ALERT, 41)
+  t_reset(); globals.G_KCAL = 800; hp = 98
+  r = cr_pools_tick("sleep", 100, hp, ""); t_eq("regen +2 at sleep*2", r[0], 100)
+  t_reset(); globals.G_KCAL = 0; hp = 10
+  r2 = cr_pools_tick("idle", 1800, hp, ""); t_eq("starve -1 per 1800 at zero", r2[0], 9)
+end function
+
+test_enemy_commit = function()
+  m = cr_blank_map()
+  y = 0
+  while y < 5
+    x = 0
+    while x < 5
+      cr_set(m, x, y, "."); x = x + 1
+    end while
+    y = y + 1
+  end while
+  enemies = [cr_make_enemy(1,1,"G",3)]
+  enemies[0]["x"] = 1; enemies[0]["y"] = 2
+  r = cr_do_time("idle", 5, m, enemies, 2, 2, 0, 20, "")
+  t_eq("adjacent enemy hits once over 5", r[1], 18)
+end function
+
+test_find_free_dot = function()
+  m = cr_blank_map()
+  y = 1
+  while y <= 3
+    x = 1
+    while x <= 3
+      cr_set(m,x,y,"."); x = x + 1
+    end while
+    y = y + 1
+  end while
+  px = 2; py = 2
+  enemies = [cr_make_enemy(1,1,"G",1)]
+  items = [{"x":3,"y":3,"name":"x"}]
+  p = cr_find_free_dot(m, 1, 1, enemies, items, px, py)
+  t_ok("find_free_dot avoids player/enemy/item", not ( (p[0]==2 and p[1]==2) or (p[0]==1 and p[1]==1) or (p[0]==3 and p[1]==3) ))
+end function
+
+test_step_toward = function()
+  m = cr_blank_map()
+  x = 0
+  while x < 5
+    cr_set(m, x, 2, "."); x = x + 1
+  end while
+  enemies = []
+  s = cr_step_toward(m, enemies, 1, 2, 4, 2)
+  t_eq("step_toward straight", cr_xy_to_str(s[0],s[1]), "2:2")
+end function
+
+// ---- entry ----
+crawl_test_main = function()
+  t_line("Running crawl tests")
+  test_idiv_mod()
+  test_bar10_bounds()
+  test_rng_determinism()
+  test_f1_no_ups()
+  test_links_pairing()
+  test_serialization_roundtrip()
+  test_pools_tick()
+  test_enemy_commit()
+  test_find_free_dot()
+  test_step_toward()
+  t_line("")
+  // derive totals from OUT to avoid scope issues
+  total = 0; fails = 0; i = 0
+  while i < OUT.len
+    s = OUT[i]
+    if s.len >= 4 and s[0:1] == "[" then total = total + 1
+    if s.len >= 6 and s[0:6] == "[FAIL]" then fails = fails + 1
+    i = i + 1
+  end while
+  t_line("Total: " + str(total) + ", Fails: " + str(fails))
+  cr_file_write_all("crawl_test.log", t_join(OUT, CR_LF))
+end function
+
+// auto-run
+crawl_test_main()

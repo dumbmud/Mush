@@ -1,0 +1,3244 @@
+// MUD — Multiverse Utility Driver
+// Author: dumbmud
+// License: GPL-3.0
+// Version: 0.0.2
+// ----------------------------------
+// Concept:
+//  - Linux‑style shell over an append‑only VFS
+//  - All persistent state is a journal in vfs.data using FS|* records
+//  - On boot we replay FS|* to build/update a persistent VFS index file (vfs.map)
+//  - Shell provides cd/ls/cat/echo/mkdir/rm/mv/touch + minimal /dev devices
+//  - Dial/logics live behind /dev entries and small builtins
+//  - Configs are plain files (e.g., /etc/progress = 0|1)
+
+MUD_VERSION = "0.0.2"
+running = true
+PWD = "/"
+HOME = "/home/user"
+VFS_IDX = "vfs.map"          // persistent VFS snapshot (human‑readable)
+DB = "vfs.data"
+LAST_CMD = ""
+LAST_OK = 1                  // success flag for chaining
+PROGRESS_CMD = ""            // store command for dial_loading_bar
+
+// --- UI sizing + padding -----------------
+SCREEN_COLS = 64
+PAGER_LINES = 20
+
+pad_spaces = function(n)
+  s = ""
+  i = 0
+  while i < n
+    s = s + " "
+    i = i + 1
+  end while
+  return s
+end function
+
+// --- UI helpers -------------------
+println = function(s)
+  print s
+  breakline
+end function
+
+trim = function(s)
+  // trims spaces, tabs, CR, LF
+  i = 0
+  j = s.len
+  // left trim
+  while i < j and (s[i] == " " or s[i] == char(9) or s[i] == char(10) or s[i] == char(13))
+    i = i + 1
+  end while
+  // right trim
+  while j > i and (s[j-1] == " " or s[j-1] == char(9) or s[j-1] == char(10) or s[j-1] == char(13))
+    j = j - 1
+  end while
+  return s[i:j]
+end function
+
+startswith = function(s, p)
+  if s.len < p.len then return false end if
+  return s[0:p.len].lower == p.lower
+end function
+
+indexof = function(hay, needle)
+  if needle.len == 0 then return 0 end if
+  i = 0
+  while i + needle.len <= hay.len
+    if hay[i:i+needle.len] == needle then return i end if
+    i = i + 1
+  end while
+  return -1
+end function
+
+month_abbr = function(m)
+  if m == 1 then return "Jan" end if
+  if m == 2 then return "Feb" end if
+  if m == 3 then return "Mar" end if
+  if m == 4 then return "Apr" end if
+  if m == 5 then return "May" end if
+  if m == 6 then return "Jun" end if
+  if m == 7 then return "Jul" end if
+  if m == 8 then return "Aug" end if
+  if m == 9 then return "Sep" end if
+  if m == 10 then return "Oct" end if
+  if m == 11 then return "Nov" end if
+  return "Dec"
+end function
+
+weekday_abbr = function(dow)
+  if dow == 0 then return "Mon" end if
+  if dow == 1 then return "Tue" end if
+  if dow == 2 then return "Wed" end if
+  if dow == 3 then return "Thu" end if
+  if dow == 4 then return "Fri" end if
+  if dow == 5 then return "Sat" end if
+  return "Sun"
+end function
+
+// --- UI ---------------------------
+ui_header = function(cmd_in)
+  // Right side first (date/time)
+  wd = weekday_abbr(getcurrentweekday())
+  h24 = gethour()
+  mi = getminute()
+  ampm = "AM"
+  if h24 >= 12 then ampm = "PM" end if
+  h12 = h24 % 12
+  if h12 == 0 then h12 = 12 end if
+  mo = month_abbr(getmonth())
+  d = getday()
+  y = getyear()
+  era = ""
+  yabs = y
+  if y < 0 then
+    era = " BC"
+    yabs = -y
+  end if
+  right = wd + " " + str(h12) + ":" + pad2(mi) + " " + ampm + " " + mo + " " + str(d) + " " + str(yabs) + era
+
+  // Left side with truncation so it never overruns
+  prefix = "[MUD] >"
+  if cfg_crab() == 1 then
+    prefix = "[MUDCRAB] >"
+  end if
+  cmd = cmd_in
+  left = prefix + cmd
+
+  avail = SCREEN_COLS - right.len - 1
+  if avail < 1 then avail = 1 end if
+  if left.len > avail then
+    cut = avail - prefix.len - 3
+    if cut < 0 then cut = 0 end if
+    left = prefix + cmd[0:cut] + "..."
+  end if
+
+  padlen = SCREEN_COLS - left.len - right.len
+  if padlen < 1 then padlen = 1 end if
+  print left + pad_spaces(padlen) + right
+  breakline
+end function
+
+refresh_ui = function()
+  clear
+  if PROGRESS_CMD != "" then
+    ui_header(PROGRESS_CMD)
+  else
+    ui_header(LAST_CMD) // for dial_loading_bar
+  end if
+end function
+
+boot_screen = function()
+  clear
+  if cfg_crab() == 1 then
+    println("      __  __ _   _ ____     (/ @  @ \)")
+    println("     |  \/  | | | |  _ \     \_|__|_/")
+    println("     | |\/| | | | | | | |   \_/    \_/")
+    println("     | |  | | |_| | |_| |   _/\ __ /\_")
+    println("     |_|  |_|\__,_|____/     _/    \_")
+    println("~~,,..::;;==---__--==;;::%%%@###%%%@###%%%@")
+    println("[MUDCRAB] Multiverse Utility Driver + Crab")
+  else
+    println("      __  __ _   _ ____")
+    println("     |  \/  | | | |  _ \")
+    println("     | |\/| | | | | | | |")
+    println("     | |  | | |_| | |_| |")
+    println("     |_|  |_|\__,_|____/")
+    println("~~,,..::;;==---__--==;;::..,,~~")
+    println("[MUD] Multiverse Utility Driver")
+  end if
+  breakline
+  println("--------------------------------")
+  println("Type 'help' for commands.")
+  LAST_CMD = ""
+end function
+
+// --- Time helpers for ETA ---
+add_minutes = function(h, m, delta)
+  tot = h*60 + m + delta
+  if tot < 0 then
+    tot = ((tot % 1440) + 1440) % 1440
+  end if
+  tot = tot % 1440
+  nh = floor(tot / 60)
+  nm = tot % 60
+  return str(nh) + "|" + str(nm)
+end function
+
+ampm_str = function(h, m)
+  ampm = "AM"
+  if h >= 12 then ampm = "PM" end if
+  h12 = h % 12
+  if h12 == 0 then h12 = 12 end if
+  return str(h12) + ":" + pad2(m) + " " + ampm
+end function
+
+eta_str_seconds = function(sec)
+  mins = ceil(sec / 4)   // 4s real = 1 in-game minute, round up
+  h = gethour()
+  mi = getminute()
+  pair = add_minutes(h, mi, mins)
+  k = indexof(pair, "|")
+  eh = str_to_int(pair[0:k])
+  em = str_to_int(pair[k+1:])
+  return ampm_str(eh, em)
+end function
+
+// --- logging ----------------------
+log_touch_file = function(p)
+  if vfs_exists_file(p) == 0 then
+    db_append("FS|mkfile|" + p)
+    vfs_touch(p)
+  end if
+end function
+
+log_event = function(kind, payload)
+  log_touch_file("/var/log/events")
+  line = timestamp() + " | " + kind + " | " + payload
+  db_append("FS|append|/var/log/events|" + escape_str(line + char(10)))
+  vfs_append("/var/log/events", line + char(10))
+end function
+
+log_touch = function()
+  if vfs_exists_file("/var/log/dial") == 0 then
+    db_append("FS|mkfile|/var/log/dial")
+    vfs_touch("/var/log/dial")
+  end if
+end function
+
+log_line = function(s)
+  log_touch()
+  db_append("FS|append|/var/log/dial|" + escape_str(s + char(10)))
+  vfs_append("/var/log/dial", s + char(10))
+end function
+
+timestamp = function()
+  y = getyear()
+  mo = pad2(getmonth())
+  d = pad2(getday())
+  h = gethour()
+  mi = pad2(getminute())
+  era = ""
+  yabs = y
+  if y < 0 then
+    era = " BC"
+    yabs = -y
+  end if
+  return pad4(yabs) + "-" + mo + "-" + d + " " + pad2(h) + ":" + mi + era
+end function
+
+log_dial = function(kind, addr, readings, eta)
+  sr = "0"
+  if readings == 1 then sr = "1" end if
+  line = timestamp() + " | dial " + kind + " | addr=" + addr + " | readings=" + sr + " | eta=" + eta
+  log_line(line)
+end function
+
+// --- DB helpers -------------------
+ensure_db = function()
+  if find(DB) == -1 then
+    create DB
+    writeline(DB, 0, "META|indexed=0")
+  else
+    first = readfile(DB, 0)
+    if first.len < 5 or first[0:5] != "META|" then
+      writeline(DB, 0, "META|indexed=0")
+    end if
+  end if
+end function
+
+db_append = function(line)
+  ensure_db()
+  writeline(DB, countlines(DB)+1, line)
+end function
+
+// Extra DB meta helpers (store replay cursor in line 0)
+db_get_indexed = function()
+  ensure_db()
+  meta = readfile(DB, 0)
+  if meta.len >= 5 and meta[0:5] == "META|" then
+    k = indexof(meta, "indexed=")
+    if k != -1 then
+      return str_to_int(trim(meta[k+8:]))
+    end if
+  end if
+  return 0
+end function
+
+db_set_indexed = function(n)
+  ensure_db()
+  writeline(DB, 0, "META|indexed=" + str(n))
+end function
+
+// --- Path helpers -----------------
+last_slash = function(s)
+  i = s.len - 1
+  while i >= 0
+    if s[i] == "/" then return i end if
+    i = i - 1
+  end while
+  return -1
+end function
+
+// --- path normalize ---------------
+normalize_path = function(p)
+  // absolute vs relative
+  if p == "" then
+    return PWD
+  end if
+
+  base = "/"
+  if p[0] != "/" then
+    if PWD == "/" then
+      base = "/" + p
+    else
+      base = PWD + "/" + p
+    end if
+  else
+    base = p
+  end if
+
+  // collapse //, /./ and /.. segments
+  out = "/"
+  i = 1  // skip first '/'
+  seg = ""
+  while i <= base.len
+    c = "/"
+    if i < base.len then
+      c = base[i]
+    end if
+
+    if c == "/" then
+      if seg == "" or seg == "." then
+        // noop
+      else if seg == ".." then
+        // pop one segment from out
+        k = last_slash(out)
+        if k > 0 then
+          out = out[0:k]
+        else
+          out = "/"
+        end if
+      else
+        if out != "/" then
+          out = out + "/" + seg
+        else
+          out = "/" + seg
+        end if
+      end if
+      seg = ""
+    else
+      seg = seg + c
+    end if
+
+    i = i + 1
+  end while
+
+  if out == "" then
+    return "/"
+  end if
+  return out
+end function
+
+parent_path = function(p)
+  p2 = normalize_path(p)
+  if p2 == "/" then return "/" end if
+  k = last_slash(p2)
+  if k <= 0 then return "/" end if
+  if k == 0 then return "/" end if
+  return p2[0:k]
+end function
+
+basename = function(p)
+  p2 = normalize_path(p)
+  if p2 == "/" then return "/" end if
+  k = last_slash(p2)
+  return p2[k+1:]
+end function
+
+// --- VFS index ops (~vfs) ---------
+idx_ensure = function()
+  if find(VFS_IDX) == -1 then
+    create VFS_IDX
+    writeline(VFS_IDX, 0, "# VFS index (D|/path) or (F|/path|content)")
+    writeline(VFS_IDX, 1, "D|/")
+  end if
+end function
+
+idx_find_line = function(prefix)
+  // returns line number of first line starting with prefix, else -1
+  if find(VFS_IDX) == -1 then return -1 end if
+  n = countlines(VFS_IDX)
+  i = 0
+  while i <= n
+    line = readfile(VFS_IDX, i)
+    if line.len >= prefix.len and line[0:prefix.len] == prefix then return i end if
+    i = i + 1
+  end while
+  return -1
+end function
+
+idx_write_line = function(ln, content)
+  writeline(VFS_IDX, ln, content)
+end function
+
+idx_append = function(content)
+  writeline(VFS_IDX, countlines(VFS_IDX)+1, content)
+end function
+
+// --- VFS primitives ---------------
+idx_find_dir = function(path)
+  if find(VFS_IDX) == -1 then return -1 end if
+  n = countlines(VFS_IDX)
+  i = 0
+  needle = "D|" + normalize_path(path)
+  while i <= n
+    line = readfile(VFS_IDX, i)
+    if line.len == needle.len and line == needle then return i end if
+    i = i + 1
+  end while
+  return -1
+end function
+
+vfs_mkdir = function(path)
+  p = normalize_path(path)
+  if p != "/" then
+    // require parent exists
+    par = parent_path(p)
+    if idx_find_dir(par) == -1 then
+      return 0
+    end if
+  end if
+  if idx_find_dir(p) == -1 then
+    idx_append("D|" + p)
+  end if
+  return 1
+end function
+
+vfs_touch = function(path)
+  p = normalize_path(path)
+  par = parent_path(p)
+  if idx_find_dir(par) == -1 then return 0 end if
+  k = idx_find_line("F|" + p + "|")
+  if k == -1 then
+    idx_append("F|" + p + "|")
+  end if
+  return 1
+end function
+
+vfs_put = function(path, content)
+  if vfs_touch(path) == 0 then return 0 end if
+  p = normalize_path(path)
+  k = idx_find_line("F|" + p + "|")
+  if k == -1 then return 0 end if
+  idx_write_line(k, "F|" + p + "|" + escape_str(content))
+  return 1
+end function
+
+vfs_append = function(path, content)
+  p = normalize_path(path)
+  k = idx_find_line("F|" + p + "|")
+  if k == -1 then return vfs_put(p, content) end if
+  line = readfile(VFS_IDX, k)
+  data = ""
+  if 2 + p.len + 1 < line.len then data = line[2 + p.len + 1:] end if
+  combined = unescape(data) + content
+  idx_write_line(k, "F|" + p + "|" + escape_str(combined))
+  return 1
+end function
+
+vfs_get = function(path)
+  p = normalize_path(path)
+  k = idx_find_line("F|" + p + "|")
+  if k == -1 then return "__NOFILE__" end if
+  line = readfile(VFS_IDX, k)
+  if 2 + p.len + 1 >= line.len then return "" end if
+  return unescape(line[2 + p.len + 1:])
+end function
+
+vfs_exists_dir = function(path)
+  return (idx_find_dir(normalize_path(path)) != -1)
+end function
+
+vfs_exists_file = function(path)
+  return (idx_find_line("F|" + normalize_path(path) + "|") != -1)
+end function
+
+vfs_rm = function(path)
+  p = normalize_path(path)
+  if not vfs_exists_dir(p) and not vfs_exists_file(p) then
+    return 0
+  end if
+
+  // In-place tombstone to avoid noisy create/delete/rename
+  n = countlines(VFS_IDX)
+  i = 0
+  while i <= n
+    line = readfile(VFS_IDX, i)
+    if line.len >= 2 then
+      if line[0:2] == "D|" or line[0:2] == "F|" then
+        // extract path portion
+        t = line[2:]
+        if line[0:2] == "F|" then
+          j = indexof(t, "|")
+          if j != -1 then
+            t = t[0:j]
+          end if
+        end if
+        // match exact path or any descendant
+        if t == p then
+          writeline(VFS_IDX, i, "#")
+        else
+          if t.len > p.len and t[0:p.len] == p and t[p.len] == "/" then
+            writeline(VFS_IDX, i, "#")
+          end if
+        end if
+      end if
+    end if
+    i = i + 1
+  end while
+  return 1
+end function
+
+vfs_mv = function(src, dst)
+  s = normalize_path(src)
+  d = normalize_path(dst)
+
+  if s == d then
+    return 1
+  end if
+  if not vfs_exists_dir(parent_path(d)) then
+    return 0
+  end if
+
+  // In-place rewrite to avoid noisy tmp/swap
+  n = countlines(VFS_IDX)
+  i = 0
+  moved_any = 0
+  saw_src_dir_line = 0
+  moved_descendant = 0
+  while i <= n
+    line = readfile(VFS_IDX, i)
+
+    if line.len >= 2 and (line[0:2] == "D|" or line[0:2] == "F|") then
+      // parse kind + path (+ data)
+      kind = line[0:1]
+      rest = line[2:]
+      path = rest
+      data = ""
+
+      if kind == "F" then
+        j = indexof(rest, "|")
+        if j != -1 then
+          path = rest[0:j]
+          data = rest[j+1:]
+        end if
+      end if
+
+      // match exact or descendant of source
+      if path == s or (path.len > s.len and path[0:s.len] == s and path[s.len] == "/") then
+        newp = d + path[s.len:]
+        if kind == "D" then
+          writeline(VFS_IDX, i, "D|" + newp)
+          moved_any = 1
+          if path == s then saw_src_dir_line = 1 end if
+          if path.len > s.len then moved_descendant = 1 end if
+        else
+          writeline(VFS_IDX, i, "F|" + newp + "|" + data)
+          moved_any = 1
+          if path.len > s.len then moved_descendant = 1 end if
+        end if
+      end if
+    end if
+
+    i = i + 1
+  end while
+
+  // Edge safety: if moving a directory whose D|src was missing but children moved,
+  // ensure a D|dst entry exists.
+  if moved_any == 1 then
+    if saw_src_dir_line == 0 and moved_descendant == 1 then
+      if idx_find_dir(d) == -1 then
+        idx_append("D|" + d)
+      end if
+    end if
+  end if
+
+  return 1
+end function
+
+vfs_ls = function(path)
+  p = normalize_path(path)
+  if not vfs_exists_dir(p) then
+    return "ls: not a directory"
+  end if
+  list = ""
+  n = countlines(VFS_IDX)
+  i = 0
+  while i <= n
+    line = readfile(VFS_IDX, i)
+    if line.len >= 2 and (line[0:2] == "D|" or line[0:2] == "F|") then
+      kind = line[0:1]
+      rest = line[2:]
+      path2 = rest
+      if kind == "F" then
+        j = indexof(rest, "|")
+        if j != -1 then path2 = rest[0:j] end if
+      end if
+      if path2.len > p.len then
+        // immediate child?
+        if p == "/" then
+          baseok = (indexof(path2[1:], "/") == -1)
+          if baseok == 1 then
+            name = path2[1:]
+            if kind == "D" then name = name + "/" end if
+            list = insert_sorted(list, name)
+          end if
+        else if path2[0:p.len] == p and path2[p.len] == "/" then
+          tail = path2[p.len+1:]
+          if indexof(tail, "/") == -1 then
+            name = tail
+            if kind == "D" then name = name + "/" end if
+            list = insert_sorted(list, name)
+          end if
+        end if
+      end if
+    end if
+    i = i + 1
+  end while
+  if list == "" then
+    return ""
+  end if
+  return join_lines_with_spaces(list)
+end function
+
+
+vfs_list_recursive = function(root)
+  p = normalize_path(root)
+  out = ""
+  n = countlines(VFS_IDX)
+  i = 0
+  nl = char(10)
+  while i <= n
+    line = readfile(VFS_IDX, i)
+    if line.len >= 2 and (line[0:2] == "D|" or line[0:2] == "F|") then
+      kind = line[0:1]
+      rest = line[2:]
+      path = rest
+      data = ""
+      if kind == "F" then
+        j = indexof(rest, "|")
+        if j != -1 then
+          path = rest[0:j]
+          data = rest[j+1:]
+        end if
+      end if
+      if path == p or (path.len > p.len and path[0:p.len] == p and path[p.len] == "/") then
+        row = kind + "|" + path
+        if kind == "F" then row = row + "|" + data end if
+        if out != "" then out = out + nl end if
+        out = out + row
+      end if
+    end if
+    i = i + 1
+  end while
+  return out
+end function
+
+// --- FS journal replay ------------
+seed_if_empty = function()
+  ensure_db()
+  n = countlines(DB)
+  hasfs = 0
+  i = 0
+  while i <= n
+    line = readfile(DB, i)
+    if line.len >= 3 and line[0:3] == "FS|" then hasfs = 1 end if
+    i = i + 1
+  end while
+  if hasfs == 1 then
+    return
+  end if
+  // seed minimal tree and configs
+  db_append("FS|mkdir|/")
+  db_append("FS|mkdir|/bin")
+  db_append("FS|mkdir|/etc")
+  db_append("FS|mkdir|/dev")
+  db_append("FS|mkdir|/home")
+  db_append("FS|mkdir|/home/user")
+  db_append("FS|mkdir|/var")
+  db_append("FS|mkdir|/var/log")
+  db_append("FS|mkdir|/tmp")
+  db_append("FS|mkfile|/etc/progress.space")
+  db_append("FS|mkfile|/etc/progress.time")
+  db_append("FS|put|/etc/progress.space|1")
+  db_append("FS|put|/etc/progress.time|0")
+  db_append("FS|mkfile|/etc/crab")
+  db_append("FS|put|/etc/crab|0")
+  db_append("FS|mkfile|/var/log/history")
+  db_append("FS|put|/etc/progress|0")  // default: no loading bar
+end function
+
+// Reset index file to a clean header and root only
+idx_reset = function()
+  idx_ensure()
+  // Write header + D|/
+  writeline(VFS_IDX, 0, "# VFS index (D|/path) or (F|/path|content)")
+  writeline(VFS_IDX, 1, "D|/")
+  // Tombstone the rest
+  n = countlines(VFS_IDX)
+  i = 2
+  while i <= n
+    writeline(VFS_IDX, i, "#")
+    i = i + 1
+  end while
+end function
+
+rebuild_vfs = function()
+  ensure_db()
+  idx_ensure()
+  n = countlines(DB)
+
+  // Replay only the tail based on META|indexed
+  start = db_get_indexed() + 1
+  if start < 1 then start = 1 end if
+  if start > n then start = n + 1 end if
+
+  i = start
+  while i <= n
+    line = readfile(DB, i)
+    if line.len >= 3 and line[0:3] == "FS|" then
+      // op|args
+      rest = line[3:]
+      j = indexof(rest, "|")
+      op = rest
+      args = ""
+      if j != -1 then
+        op = rest[0:j]
+        args = rest[j+1:]
+      end if
+
+      if op == "mkdir" then
+        vfs_mkdir(args)
+      end if
+
+      if op == "mkfile" then
+        vfs_touch(args)
+      end if
+
+      if op == "put" then
+      k = indexof(args, "|")
+      if k != -1 then
+          vfs_put(args[0:k], unescape(args[k+1:]))
+      end if
+      end if
+
+      if op == "append" then
+        k = indexof(args, "|")
+      if k != -1 then
+        vfs_append(args[0:k], unescape(args[k+1:]))
+        end if
+      end if
+
+      if op == "rm" then
+        vfs_rm(args)
+      end if
+
+      if op == "mv" then
+        k = indexof(args, "|")
+        if k != -1 then
+          vfs_mv(args[0:k], args[k+1:])
+        end if
+      end if
+    end if
+
+    i = i + 1
+  end while
+
+  // update cursor to end of journal
+  db_set_indexed(n)
+end function
+
+// --- String escape handling -------
+unescape = function(s)
+  out = ""
+  i = 0
+  while i < s.len
+    c = s[i]
+    if c == "\\" and i+1 < s.len then
+      n = s[i+1]
+      if n == "n" then
+        out = out + char(10)
+      else if n == "t" then
+        out = out + char(9)
+      else if n == "r" then
+        out = out + char(13)
+      else if n == char(34) then
+        out = out + char(34)
+      else if n == "\\" then
+        out = out + "\\"
+      else
+        out = out + n
+      end if
+      i = i + 2
+    else
+      out = out + c
+      i = i + 1
+    end if
+  end while
+  return out
+end function
+
+escape_str = function(s)
+  out = ""
+  i = 0
+  while i < s.len
+    c = s[i]
+    if c == "\\" then
+      out = out + "\\\\"
+    else if c == char(10) then
+      out = out + "\\n"
+    else if c == char(9) then
+      out = out + "\\t"
+    else if c == char(13) then
+      out = out + "\\r"
+    else if c == char(34) then
+      out = out + "\\" + char(34)
+    else
+      out = out + c
+    end if
+    i = i + 1
+  end while
+  return out
+end function
+
+str_compare = function(a, b)
+  i = 0
+  while i < a.len and i < b.len
+    ca = a[i]
+    cb = b[i]
+    if ca < cb then return -1 end if
+    if ca > cb then return 1 end if
+    i = i + 1
+  end while
+  if a.len < b.len then return -1 end if
+  if a.len > b.len then return 1 end if
+  return 0
+end function
+
+insert_sorted = function(list, name)
+  nl = char(10)
+  if list == "" then
+    return name
+  end if
+  out = ""
+  i = 0
+  start = 0
+  inserted = 0
+  while i <= list.len
+    if i == list.len or list[i] == nl then
+      row = list[start:i]
+      if inserted == 0 then
+        cmp = str_compare(name, row)
+        if cmp == -1 or cmp == 0 then
+          if out != "" then out = out + nl end if
+          out = out + name
+          inserted = 1
+        end if
+      end if
+      if out != "" then out = out + nl end if
+      out = out + row
+      start = i + 1
+    end if
+    i = i + 1
+  end while
+  if inserted == 0 then
+    if out != "" then out = out + nl end if
+    out = out + name
+  end if
+  return out
+end function
+
+join_lines_with_spaces = function(list)
+  nl = char(10)
+  out = ""
+  i = 0
+  while i < list.len
+    c = list[i]
+    if c == nl then
+      out = out + "  "
+    else
+      out = out + c
+    end if
+    i = i + 1
+  end while
+  return out
+end function
+
+// --- Devices (/dev) ---------------
+// Supported:
+//  - write /dev/gate/dial  (content = addr or timecode)
+//  - read  /dev/gate/readings
+//  - write /dev/gate/recall (any content)
+//  - read  /dev/sensors/temp
+
+char_to_digit = function(c)
+  if c == "0" then return 0 end if
+  if c == "1" then return 1 end if
+  if c == "2" then return 2 end if
+  if c == "3" then return 3 end if
+  if c == "4" then return 4 end if
+  if c == "5" then return 5 end if
+  if c == "6" then return 6 end if
+  if c == "7" then return 7 end if
+  if c == "8" then return 8 end if
+  if c == "9" then return 9 end if
+  return -1
+end function
+
+is_all_digits = function(s)
+  if s.len == 0 then return 0 end if
+  i = 0
+  while i < s.len
+    if char_to_digit(s[i]) < 0 then return 0 end if
+    i = i + 1
+  end while
+  return 1
+end function
+
+is_time_code = function(s)
+  if s.len == 12 then return is_all_digits(s) end if
+  if s.len == 13 and s[0] == "-" then return is_all_digits(s[1:]) end if
+  return 0
+end function
+
+is_space_addr = function(s)
+  if s.len != 5 then return 0 end if
+  i = 0
+  while i < 5
+    c = s[i].lower
+    if c < "a" or c > "x" then return 0 end if
+    i = i + 1
+  end while
+  return 1
+end function
+
+// label = address/timecode string, eta = "H:MM AM/PM"
+dial_loading_bar = function(label, eta)
+  total = 26
+  wait 1 // give time to display intrinsic results
+  i = 0
+  while i <= total
+    refresh_ui()
+    println("Dialing " + label + "   ETA " + eta)
+    pct = floor(i * 100 / total)
+    filled = floor(i * 20 / total)
+    empty = 20 - filled
+    bar = "[" + repeats("#", filled) + repeats(".", empty) + "]  " + pad3(pct) + "%"
+    println(bar)
+    println("Waiting for readings...")
+    wait 1
+    i = i + 1
+  end while
+end function
+
+repeats = function(ch, n)
+  s = ""
+  i = 0
+  while i < n
+    s = s + ch
+    i = i + 1
+  end while
+  return s
+end function
+
+// --- Dial config (per-mode) -------
+cfg_progress_space = function()
+  v = "__NOFILE__"
+  if vfs_exists_file("/etc/progress.space") then v = vfs_get("/etc/progress.space") end if
+  if v == "__NOFILE__" then return 1 end if
+  vv = trim(v).lower
+  if vv == "1" or vv == "on" or vv == "true" then return 1 end if
+  return 0
+end function
+
+cfg_progress_time = function()
+  v = "__NOFILE__"
+  if vfs_exists_file("/etc/progress.time") then v = vfs_get("/etc/progress.time") end if
+  if v == "__NOFILE__" then return 0 end if
+  vv = trim(v).lower
+  if vv == "1" or vv == "on" or vv == "true" then return 1 end if
+  return 0
+end function
+
+cfg_crab = function()
+  v = "__NOFILE__"
+  if vfs_exists_file("/etc/crab") then v = vfs_get("/etc/crab") end if
+  if v == "__NOFILE__" then return 0 end if
+  vv = trim(v).lower
+  if vv == "1" or vv == "on" or vv == "true" then return 1 end if
+  return 0
+end function
+
+run_intrinsic = function(name, arg)
+  n = trim(name).lower
+
+  // 1-arg: dialgate
+  if n == "dialgate" then
+    a = trim(arg)
+    if a == "" then
+        LAST_OK=0
+        return "dialgate: missing arg"
+    end if
+    if is_time_code(a) then
+      num = 0
+      neg = 0
+      i = 0
+      if a[0] == "-" then
+        neg = 1
+      end if
+      while i < a.len
+        d = char_to_digit(a[i])
+        if d >= 0 then
+            num = num*10 + d
+        end if
+        i = i + 1
+      end while
+      if neg == 1 then num = -num end if
+      dialgate num
+    else if is_space_addr(a) or a.lower == "xxxxx" then
+      dialgate a
+    else
+      LAST_OK=0; return "dialgate: invalid address"
+    end if
+    LAST_OK=1; return ""
+  end if
+
+  // 0-arg: common intrinsics
+  if n == "recalltimegate" then
+    recalltimegate
+    LAST_OK=1
+    return ""
+  end if
+  if n == "gatereadings" then
+    gatereadings()
+    LAST_OK=1
+    return ""
+  end if
+  if n == "openperipheral" then
+    openperipheral()
+    LAST_OK=1
+    return ""
+  end if
+  if n == "closeperipheral" then
+    closeperipheral()
+    LAST_OK=1
+    return ""
+  end if
+  if n == "setfactionmimcore" then
+    SetFactionMimCore()
+    LAST_OK=1
+    return ""
+  end if
+
+  // 0-arg with output
+  if n == "gettemperature" then
+    t = gettemperature;
+    LAST_OK=1;
+    return str(t)
+  end if
+
+  // Coco/Crab cheat help (does nothing if game disables it)
+  if n == "cocohelp" or n == "crabhelp" then
+    cocohelp()
+    LAST_OK=1
+    return ""
+  end if
+
+  return "__NOINTRINSIC__"
+end function
+
+// dev write/read
+_dev_write = function(path, data)
+  if path == "/dev/gate/dial" then
+    addr = trim(data)
+
+    PROGRESS_CMD = "dial " + addr
+
+    connectgate
+    wait 2
+    if is_space_addr(addr) or addr.lower == "xxxxx" then
+      dialgate addr
+      eta = eta_str_seconds(27)
+      show = cfg_progress_space()
+      log_dial("space", addr, show, eta)
+      println("ETA " + eta)
+      if cfg_progress_space() == 1 then
+        dial_loading_bar(addr, eta)
+        gatereadings()
+      end if
+      PROGRESS_CMD = ""
+      return ""
+    else if is_time_code(addr) then
+      // string -> int
+      num = 0; neg = 0; i = 0
+      if addr[0] == "-" then neg = 1 end if
+      while i < addr.len
+        d = char_to_digit(addr[i])
+        if d >= 0 then num = num * 10 + d end if
+        i = i + 1
+      end while
+      if neg == 1 then num = -num end if
+      dialgate num
+      eta = eta_str_seconds(27)
+      show = cfg_progress_time()
+      log_dial("time", addr, show, eta)
+      println("ETA " + eta)
+      if cfg_progress_time() == 1 then
+        dial_loading_bar(addr, eta)
+        gatereadings()
+      end if
+      PROGRESS_CMD = ""
+      return ""
+    else
+      PROGRESS_CMD = ""
+      return "dial: invalid address"
+    end if
+end if
+
+  if path == "/dev/gate/recall" then
+    recalltimegate
+    log_event("gate", "recall")
+    return "(recall)"
+  end if
+  return "dev: unsupported write"
+end function
+
+_dev_read = function(path)
+  if path == "/dev/gate/readings" then
+    gatereadings()
+    return ""
+  end if
+  if path == "/dev/sensors/temp" then
+    t = gettemperature
+    return str(t)
+  end if
+  return "dev: unsupported read"
+end function
+
+// --- Builtin commands -------------
+cmd_pwd = function()
+  LAST_OK = 1
+  return PWD
+end function
+
+cmd_cd = function(arg)
+  if arg == "" then arg = HOME end if
+  p = normalize_path(arg)
+  if vfs_exists_dir(p) == 0 then
+    LAST_OK = 0
+    return "cd: no such directory"
+  end if
+  PWD = p
+  LAST_OK = 1
+  return ""
+end function
+
+cmd_ls = function(arg)
+  // supports: ls, ls DIR
+  target = ""
+  a = trim(arg)
+  if a == "" then
+    target = PWD
+  else
+    target = a
+  end if
+  out = vfs_ls(target)
+  if out.len >= 3 and out[0:3] == "ls:" then
+    LAST_OK = 0
+    return out
+  end if
+  LAST_OK = 1
+  return out
+end function
+
+cmd_cat = function(arg)
+  if arg == "" then
+    LAST_OK = 0
+    return "cat: missing path"
+  end if
+  p = normalize_path(arg)
+  if startswith(p, "/dev/") then
+    res = _dev_read(p)
+    if res.len >= 4 and res[0:4] == "dev:" then
+      LAST_OK = 0
+    else
+      LAST_OK = 1
+    end if
+    return res
+  end if
+  if vfs_exists_file(p) == 0 then
+    if vfs_exists_dir(p) == 1 then
+      LAST_OK = 0
+      return "cat: is a directory"
+    end if
+    LAST_OK = 0
+    return "cat: no such file"
+  end if
+  LAST_OK = 1
+  return vfs_get(p)
+end function
+
+cmd_version = function()
+    LAST_OK=1
+    return "MUD " + MUD_VERSION
+end function
+
+cmd_echo = function(rest)
+  s = trim(rest)
+  nonl = 0
+  if startswith(s, "-n ") then
+    nonl = 1
+    s = trim(s[3:])
+  end if
+  if s.len >= 2 and s[0] == char(34) and s[s.len-1] == char(34) then
+    s = unescape(s[1:s.len-1])
+  end if
+  if nonl == 1 then
+    print s
+    LAST_OK=1
+    return ""
+  end if
+  LAST_OK = 1
+  return s
+end function
+
+// sleep
+cmd_sleep = function(arg)
+  n = str_to_int(trim(arg)); if n < 0 then n = 0 end if
+  wait n; LAST_OK = 1; return ""
+end function
+
+// true/false
+cmd_true = function()
+    LAST_OK = 1
+    return ""
+end function
+
+cmd_false = function()
+    LAST_OK = 0
+    return ""
+end function
+
+// which (builtins only for now)
+cmd_which = function(arg)
+  name = trim(arg)
+  if name == "" then
+    LAST_OK=0
+    return "which: missing name"
+  end if
+  builtins = "pwd cd ls cat echo mkdir rm mv touch dial dialgate cardiag car year cantravel timegraph hack temp help fsck write cp rmdir head tail wc grep find date clear vacuum history sleep true false which less version crab coco cocohelp crabhelp"
+  if indexof(" " + builtins + " ", " " + name + " ") != -1 then
+    LAST_OK = 1
+    return name + ": builtin"
+  end if
+  LAST_OK = 1
+  return name + " not found"
+end function
+
+cmd_mkdir = function(arg)
+  if arg == "" then
+    LAST_OK = 0
+    return "mkdir: missing path"
+  end if
+  p = normalize_path(arg)
+  pp = parent_path(p)
+  if vfs_exists_dir(pp) == 0 then
+    LAST_OK = 0
+    return "mkdir: parent missing"
+  end if
+  db_append("FS|mkdir|" + p)
+  ok = vfs_mkdir(p)
+  if ok == 1 then
+    LAST_OK = 1
+    log_event("fs", "mkdir " + p + " ok=1")
+    return "created " + p
+  end if
+  LAST_OK = 0
+  log_event("fs", "mkdir " + p + " ok=0")
+  return "mkdir: failed"
+end function
+
+cmd_touch = function(arg)
+  if arg == "" then
+    LAST_OK = 0
+    return "touch: missing path"
+  end if
+  p = normalize_path(arg)
+  if vfs_exists_dir(parent_path(p)) == 0 then
+    LAST_OK = 0
+    return "touch: parent missing"
+  end if
+  if vfs_exists_file(p) == 0 then
+    db_append("FS|mkfile|" + p)
+  end if
+  ok = vfs_touch(p)
+  if ok == 1 then
+    LAST_OK = 1
+    log_event("fs", "touch " + p + " ok=1")
+    return "touched " + p
+  end if
+  LAST_OK = 0
+  log_event("fs", "touch " + p + " ok=0")
+  return "touch: failed"
+end function
+
+cmd_rm = function(arg)
+  if arg == "" then
+    LAST_OK = 0
+    return "rm: missing operand"
+  end if
+  r = trim(arg)
+  recursive = 0
+  p = r
+  if startswith(r, "-r ") then
+    recursive = 1
+    p = trim(r[3:])
+  else if r == "-r" then
+    LAST_OK = 0
+    return "rm: missing operand"
+  end if
+
+  path = normalize_path(p)
+  isf = vfs_exists_file(path)
+  isd = vfs_exists_dir(path)
+
+  if isf == 0 and isd == 0 then
+    LAST_OK = 0
+    log_event("fs", "rm " + path + " refused_dir")
+    return "rm: no such file or directory"
+  end if
+
+  if recursive == 0 then
+    if isd == 1 then
+      LAST_OK = 0
+      return "rm: is a directory"
+    end if
+    db_append("FS|rm|" + path)
+    vfs_rm(path)
+    log_event("fs", "rm " + path + " ok=1")
+    LAST_OK = 1
+    return "removed " + path
+  end if
+
+  // recursive
+  db_append("FS|rm|" + path)
+  vfs_rm(path)
+  log_event("fs", "rm -r " + path + " ok=1")
+  LAST_OK = 1
+  return "removed " + path
+end function
+
+// rmdir DIR (only if empty)
+cmd_rmdir = function(arg)
+  if arg == "" then
+    LAST_OK = 0
+    return "rmdir: missing path"
+  end if
+  p = normalize_path(arg)
+  if vfs_exists_dir(p) == 0 then
+    LAST_OK = 0
+    log_event("fs", "rmdir " + p + " missing")
+    return "rmdir: no such directory"
+  end if
+  // check emptiness
+  n = countlines(VFS_IDX); i = 0; empty = 1
+  while i <= n
+    line = readfile(VFS_IDX, i)
+    if line.len >= 2 and (line[0:2] == "D|" or line[0:2] == "F|") then
+      rest = line[2:]; path = rest
+      if line[0:1] == "F" then
+        j = indexof(rest, "|")
+        if j != -1 then
+          path = rest[0:j]
+        end if
+      end if
+      if path.len > p.len and path[0:p.len] == p and path[p.len] == "/" then empty = 0 end if
+    end if
+    i = i + 1
+  end while
+  if empty == 0 then
+    LAST_OK = 0
+    log_event("fs", "rmdir " + p + " not_empty")
+    return "rmdir: not empty"
+  end if
+  db_append("FS|rm|" + p); vfs_rm(p); log_event("fs", "rmdir " + p + " ok=1"); LAST_OK = 1; return "removed " + p
+end function
+
+cmd_mv = function(a, b)
+  if a == "" or b == "" then
+    LAST_OK = 0
+    return "mv: missing args"
+  end if
+  s = normalize_path(a)
+  d = normalize_path(b)
+  if vfs_exists_file(s) == 0 and vfs_exists_dir(s) == 0 then
+    LAST_OK = 0
+    log_event("fs", "mv " + s + " -> " + d + " source_missing")
+    return "mv: source missing"
+  end if
+  if vfs_exists_dir(parent_path(d)) == 0 then
+    LAST_OK = 0
+    log_event("fs", "mv " + s + " -> " + d + " source_missing")
+    return "mv: dest parent missing"
+  end if
+  db_append("FS|mv|" + s + "|" + d)
+  vfs_mv(s, d)
+  log_event("fs", "mv " + s + " -> " + d + " ok=1")
+  LAST_OK = 1
+  return "moved " + s + " -> " + d
+end function
+
+cmd_cp = function(a, b)
+  if a == "" or b == "" then
+    LAST_OK = 0
+    return "cp: missing args"
+  end if
+  s = normalize_path(a)
+  d = normalize_path(b)
+  s_is_file = vfs_exists_file(s)
+  s_is_dir  = vfs_exists_dir(s)
+  if s_is_file == 0 and s_is_dir == 0 then
+    LAST_OK = 0
+    log_event("fs", "cp " + s + " -> " + d + " source_missing")
+    return "cp: source missing"
+  end if
+
+  d_is_file = vfs_exists_file(d)
+  d_is_dir  = vfs_exists_dir(d)
+
+  // compute final destination
+  if s_is_file == 1 then
+    // file -> dest
+    if d_is_dir == 1 then
+      d_final = d + "/" + basename(s)
+    else
+      d_final = d
+    end if
+    if vfs_exists_dir(parent_path(d_final)) == 0 then
+      LAST_OK = 0
+      log_event("fs", "cp " + s + " -> " + d + " dest_parent_missing")
+      return "cp: dest parent missing"
+    end if
+    data = vfs_get(s)
+    db_append("FS|mkfile|" + d_final)
+    vfs_touch(d_final)
+    db_append("FS|put|" + d_final + "|" + escape_str(data))
+    vfs_put(d_final, data)
+
+    log_event("fs", "cp " + s + " -> " + d_final + " ok=1")
+    LAST_OK = 1
+    return "copied " + s + " -> " + d_final
+  end if
+
+  // dir source
+  if d_is_file == 1 then
+    LAST_OK = 0
+    return "cp: cannot overwrite non-directory '" + d + "' with directory"
+  end if
+  if d_is_dir == 1 then
+    d_base = d + "/" + basename(s)
+  else
+    d_base = d
+  end if
+  if vfs_exists_dir(parent_path(d_base)) == 0 then
+    LAST_OK = 0
+    log_event("fs", "cp " + s + " -> " + d + " dest_parent_missing")
+    return "cp: dest parent missing"
+  end if
+
+  // ensure base dir
+  db_append("FS|mkdir|" + d_base)
+  vfs_mkdir(d_base)
+
+  // recursive copy via index walk
+  lst = vfs_list_recursive(s)
+  i = 0; start = 0
+  while i <= lst.len
+    if i == lst.len or lst[i] == char(10) then
+      row = lst[start:i]; start = i + 1
+      if row.len >= 2 then
+        knd = row[0:1]; rest = row[2:]
+        pth = rest; dat = ""
+        if knd == "F" then
+          j = indexof(rest, "|")
+          if j != -1 then
+            pth = rest[0:j]
+            dat = rest[j+1:]
+          end if
+        end if
+        np = d_base + pth[s.len:]
+        if knd == "D" then
+          if idx_find_dir(np) == -1 then
+            db_append("FS|mkdir|" + np)
+            vfs_mkdir(np)
+          end if
+        else
+          db_append("FS|mkfile|" + np)
+          vfs_touch(np)
+          if dat != "" then
+            raw = unescape(dat)
+            db_append("FS|put|" + np + "|" + escape_str(raw))
+            vfs_put(np, raw)
+          end if
+        end if
+      end if
+    end if
+    i = i + 1
+  end while
+  LAST_OK = 1
+  log_event("fs", "cp " + s + " -> " + d_final + " ok=1")
+  return "copied " + s + " -> " + d_base
+end function
+
+// head [-n N] FILE
+cmd_head = function(rest)
+  r = trim(rest)
+  n = 10
+  path = ""
+
+  if startswith(r, "-n ") then
+    rr = trim(r[3:])
+    sp = indexof(rr, " ")
+    if sp == -1 then
+      LAST_OK = 0
+      return "head: usage head [-n N] FILE"
+    end if
+    n = str_to_int(trim(rr[0:sp]))
+    path = trim(rr[sp+1:])
+  else
+    sp = indexof(r, " ")
+    if sp != -1 and char_to_digit(r[0]) >= 0 then
+      n = str_to_int(trim(r[0:sp]))
+      path = trim(r[sp+1:])
+    else
+      path = r
+    end if
+  end if
+
+  if path == "" then
+    LAST_OK = 0
+    return "head: missing file"
+  end if
+  if vfs_exists_file(normalize_path(path)) == 0 then
+    LAST_OK = 0
+    return "head: no such file"
+  end if
+
+  s = vfs_get(normalize_path(path))
+  nl = char(10)
+  i = 0
+  lines = 0
+  out = ""
+
+  while i < s.len and lines < n
+    c = s[i]
+    out = out + c
+    if c == nl then
+      lines = lines + 1
+    end if
+    i = i + 1
+  end while
+
+  LAST_OK = 1
+  return out
+end function
+
+// tail [-n N] FILE
+// tail [-n N] [-f] FILE
+cmd_tail = function(rest)
+  r = trim(rest)
+  n = 10
+  follow = 0
+  path = ""
+
+  // parse options (-f, -n N, -nN), any order at the front
+  while true
+    changed = 0
+
+    // -f
+    if startswith(r, "-f ") then
+      follow = 1
+      r = trim(r[3:])
+      changed = 1
+    else if r == "-f" then
+      follow = 1
+      r = ""
+      changed = 1
+    end if
+
+    // -n N
+    if changed == 0 and startswith(r, "-n ") then
+      rr = trim(r[3:])
+      sp = indexof(rr, " ")
+      if sp == -1 then
+        LAST_OK = 0
+        return "tail: usage tail [-n N] [-f] FILE"
+      end if
+      n = str_to_int(trim(rr[0:sp]))
+      r = trim(rr[sp+1:])
+      changed = 1
+    end if
+
+    // -nN (no space)
+    if changed == 0 and r.len >= 3 and r[0:2] == "-n" and char_to_digit(r[2]) >= 0 then
+      j = 2
+      while j < r.len and char_to_digit(r[j]) >= 0
+        j = j + 1
+      end while
+      n = str_to_int(r[2:j])
+      r = trim(r[j:])
+      changed = 1
+    end if
+
+    if changed == 0 then
+      break
+    end if
+  end while
+
+  // fallback: numeric-first form "tail N FILE"
+  if path == "" then
+    spx = indexof(r, " ")
+    if spx != -1 and r.len > 0 and char_to_digit(r[0]) >= 0 then
+      n = str_to_int(trim(r[0:spx]))
+      path = trim(r[spx+1:])
+    else
+      path = trim(r)
+    end if
+  end if
+
+  if path == "" then
+    LAST_OK = 0
+    return "tail: missing file"
+  end if
+
+  p = normalize_path(path)
+  if vfs_exists_file(p) == 0 then
+    LAST_OK = 0
+    return "tail: no such file"
+  end if
+
+  s = vfs_get(p)
+  nl = char(10)
+
+  // find start of last n lines
+  need = n
+  pos = s.len - 1
+  while pos >= 0 and need > 0
+    if s[pos] == nl then
+      need = need - 1
+    end if
+    pos = pos - 1
+  end while
+  if pos < 0 then
+    pos = -1
+  end if
+
+  if follow == 0 then
+    LAST_OK = 1
+    return s[pos+1:]
+  end if
+
+  // follow mode: print current tail, then stream new data
+  chunk = s[pos+1:]
+  if chunk != "" then
+    println(chunk)
+  end if
+  last_len = s.len
+  LAST_OK = 1
+  while true
+    s2 = vfs_get(p)
+    if s2.len > last_len then
+      println(s2[last_len:])
+      last_len = s2.len
+    end if
+    wait 1
+    yield
+  end while
+
+  return ""
+end function
+
+// wc FILE
+cmd_wc = function(arg)
+  if arg == "" then
+    LAST_OK = 0
+    return "wc: missing file"
+  end if
+  p = normalize_path(arg)
+  if vfs_exists_file(p) == 0 then
+    LAST_OK = 0
+    return "wc: no such file"
+  end if
+  s = vfs_get(p); nl = char(10)
+  i = 0; lines = 0; bytes = s.len; words = 0; inw = 0
+  while i < s.len
+    c = s[i]
+    if c == nl then lines = lines + 1 end if
+    if c == " " or c == nl or c == char(9) or c == char(13) then
+      if inw == 1 then
+        words = words + 1
+        inw = 0
+      end if
+    else
+      inw = 1
+    end if
+    i = i + 1
+  end while
+  if inw == 1 then words = words + 1 end if
+  LAST_OK = 1; return str(lines) + " " + str(words) + " " + str(bytes)
+end function
+
+// grep PATTERN FILE
+cmd_grep = function(rest)
+  sp = indexof(rest, " ")
+  if sp == -1 then
+    LAST_OK = 0
+    return "grep: usage grep PATTERN FILE"
+  end if
+  pat = trim(rest[0:sp]); file = normalize_path(trim(rest[sp+1:]))
+  if pat.len >= 2 and pat[0] == char(34) and pat[pat.len-1] == char(34) then pat = unescape(pat[1:pat.len-1]) end if
+  if vfs_exists_file(file) == 0 then
+    LAST_OK = 0
+    return "grep: no such file"
+  end if
+  s = vfs_get(file); nl = char(10); out = ""; buf = ""; i = 0
+  while i <= s.len
+    c = char(10); if i < s.len then c = s[i] end if
+    if c == nl then
+      if indexof(buf, pat) != -1 then
+        if out != "" then
+          out = out + nl
+        end if
+        out = out + buf
+      end if
+      buf = ""
+    else
+      buf = buf + c
+    end if
+    i = i + 1
+  end while
+  LAST_OK = 1; return out
+end function
+
+// find DIR  (list all entries under DIR)
+cmd_find = function(arg)
+  if arg == "" then
+    LAST_OK = 0
+    return "find: missing path"
+  end if
+  p = normalize_path(arg)
+  if vfs_exists_dir(p) == 0 then
+    LAST_OK = 0
+    return "find: no such directory"
+  end if
+  rows = vfs_list_recursive(p); out = ""; nl = char(10)
+  i = 0; start = 0
+  while i <= rows.len
+    if i == rows.len or rows[i] == nl then
+      row = rows[start:i]; start = i + 1
+      if row.len >= 2 then
+        typ = row[0:1]; rest = row[2:]; path = rest
+        if typ == "F" then
+          j = indexof(rest, "|")
+          if j != -1 then
+            path = rest[0:j]
+          end if
+        end if
+        name = path
+        if typ == "D" then
+          name = name + "/"
+        end if
+        if out != "" then
+          out = out + nl
+        end if
+        out = out + name
+      end if
+    end if
+    i = i + 1
+  end while
+  LAST_OK = 1; return out
+end function
+
+cmd_less = function(arg)
+  p = normalize_path(trim(arg))
+  if p == "" then
+    LAST_OK = 0
+    return "less: missing file"
+  end if
+  if vfs_exists_file(p) == 0 then
+    LAST_OK = 0
+    return "less: no such file"
+  end if
+  s = vfs_get(p); nl = char(10)
+  i = 0; lines = 0; page = 0
+  while i <= s.len
+    c = nl; if i < s.len then c = s[i] end if
+    if c == nl then lines = lines + 1 end if
+    print c
+    if lines >= PAGER_LINES then
+      print "--More-- (q to quit, anything to continue)"; breakline
+      inp = readline
+      if inp.len > 0 and inp[0].lower == "q" then
+        LAST_OK = 1
+        return ""
+      end if
+      lines = 0
+      clear; ui_header(LAST_CMD)
+    end if
+    i = i + 1
+  end while
+  LAST_OK = 1
+  return ""
+end function
+
+// date
+cmd_date = function()
+  wd = weekday_abbr(getcurrentweekday())
+  h24 = gethour(); mi = getminute(); ampm = "AM"; if h24 >= 12 then ampm = "PM" end if
+  h12 = h24 % 12; if h12 == 0 then h12 = 12 end if
+  mo = month_abbr(getmonth()); d = getday(); y = getyear()
+  era = ""; yabs = y
+  if y < 0 then
+    era = " BC"
+    yabs = -y
+  end if
+  LAST_OK = 1
+  return wd + " " + str(h12) + ":" + pad2(mi) + " " + ampm + " " + mo + " " + str(d) + " " + str(yabs) + era
+end function
+
+// clear
+cmd_clear = function()
+  // system auto clears on each command
+  LAST_OK = 1
+  return ""
+end function
+
+// vacuum (rebuild minimal vfs.data from current index)
+cmd_vacuum = function()
+  // build new journal in tmp
+  tmp = "vfs.data.tmp"
+  create tmp
+  writeline(tmp, 0, "META|indexed=0")
+  // seed minimal tree from index
+  n = countlines(VFS_IDX); i = 0
+  while i <= n
+    line = readfile(VFS_IDX, i)
+    if line.len >= 2 and line[0] != "#" then
+      if line[0:2] == "D|" then
+        path = line[2:]; writeline(tmp, countlines(tmp)+1, "FS|mkdir|" + path)
+      else if line[0:2] == "F|" then
+        rest = line[2:]; j = indexof(rest, "|"); if j != -1 then
+          p = rest[0:j]; data = rest[j+1:]
+          writeline(tmp, countlines(tmp)+1, "FS|mkfile|" + p)
+          if data != "" then
+            writeline(tmp, countlines(tmp)+1, "FS|put|" + p + "|" + data)
+          end if
+        end if
+      end if
+    end if
+    i = i + 1
+  end while
+  // swap in
+  delete DB
+  rename tmp, DB
+  // rebuild index from scratch
+  idx_reset(); db_set_indexed(0); rebuild_vfs()
+  log_event("maintenance", "vacuum")
+  LAST_OK = 1
+  return "vacuumed"
+end function
+
+// history [N]  (reads /var/log/history)
+cmd_history = function(arg)
+  nreq = 20
+  a = trim(arg)
+  if a != "" then
+    nreq = str_to_int(a)
+    if nreq <= 0 then
+      LAST_OK = 0
+      return "history: N must be positive"
+    end if
+  end if
+  p = "/var/log/history"
+  if vfs_exists_file(p) == 0 then
+    LAST_OK = 1
+    return ""
+  end if
+  s = vfs_get(p); nl = char(10)
+  // collect last N lines
+  i = s.len - 1; lines = 0; start = 0
+  while i >= 0 and lines < nreq
+    if s[i] == nl then lines = lines + 1 end if
+    i = i - 1
+  end while
+  if i < 0 then i = -1 end if
+  LAST_OK = 1; return s[i+1:]
+end function
+
+// Convenience builtin: dial ADDR|somewhere|somewhen
+random_space_addr = function()
+  addr = ""
+  i = 0
+  while i < 5
+    addr = addr + char(floor(rnd * 24) + 97)
+    i = i + 1
+  end while
+  return addr
+end function
+
+str_to_int = function(s)
+  neg = 0
+  i = 0
+  if s.len > 0 and s[0] == "-" then neg = 1 end if
+  val = 0
+  j = 0
+  while j < s.len
+    d = char_to_digit(s[j])
+    if d >= 0 then val = val * 10 + d end if
+    j = j + 1
+  end while
+  if neg == 1 then val = -val end if
+  return val
+end function
+
+// Coerce strings like "10" -> 10
+to_number = function(x)
+  s = trim(x)
+  if s.len >= 2 and s[0] == char(34) and s[s.len-1] == char(34) then
+    s = unescape(s[1:s.len-1])
+  end if
+  return str_to_int(s)
+end function
+
+cfg_timerange = function()
+  // /etc/timerange content: MIN|MAX  (defaults 1..3033)
+  if vfs_exists_file("/etc/timerange") == 0 then return "1|3033" end if
+  cont = vfs_get("/etc/timerange")
+  if cont == "" then return "1|3033" end if
+  return cont
+end function
+
+random_time_code = function()
+  rng = cfg_timerange()
+  k = indexof(rng, "|")
+  mins = "1"
+  maxs = "3033"
+  if k != -1 then
+    mins = rng[0:k]
+    maxs = rng[k+1:]
+  end if
+  a = str_to_int(mins)
+  b = str_to_int(maxs)
+  if b < a then
+    t = a; a = b; b = t
+  end if
+  // hard clamp to allowed range 1..3033
+  if a < 1 then a = 1 end if
+  if b > 3033 then b = 3033 end if
+  if b < a then
+    a = 1
+    b = 3033
+  end if
+  span = b - a + 1
+  off = floor(rnd * span)
+  year = a + off
+  mo = pad2(ceil(rnd * 12))
+  dy = pad2(ceil(rnd * 28))
+  hr = pad2(floor(rnd * 24))
+  mi = pad2(floor(rnd * 60))
+  code = mo + dy + pad4(year) + hr + mi
+  log_event("somewhen", "generated " + code)
+  return code
+end function
+
+pad2 = function(n)
+  s = str(n)
+  if s.len == 1 then return "0" + s end if
+  return s
+end function
+
+pad3 = function(n)
+  s = str(n)
+  while s.len < 3
+    s = " " + s
+  end while
+  return s
+end function
+
+pad4 = function(n)
+  s = str(n)
+  while s.len < 4
+    s = "0" + s
+  end while
+  return s
+end function
+
+cmd_dial = function(arg)
+  a = trim(arg)
+  if a == "" then
+    LAST_OK = 0
+    return "usage: dial [-r|--readings] ADDR|TIME|somewhere|somewhen | dial progress [space|time] [on|off] | dial read|readings | dial recall | dial connect | dial timewindow [MIN MAX]"
+  end if
+
+  low = a.lower
+
+  // quick verbs
+  if low == "connect" then
+    connectgate
+    LAST_OK = 1
+    return ""
+  end if
+  if low == "read" or low == "readings" then
+    gatereadings()
+    LAST_OK = 1
+    return ""
+  end if
+  if low == "recall" then
+    recalltimegate
+    LAST_OK = 1
+    return ""
+  end if
+
+  // timewindow (unchanged)
+  if startswith(low, "timewindow") then
+    rest = ""
+    if a.len > 10 then rest = trim(a[10:]) end if
+    if rest == "" then
+      LAST_OK = 1
+      return "timewindow " + cfg_timerange()
+    end if
+    sp = indexof(rest, " ")
+    if sp == -1 then
+      LAST_OK = 0
+      return "timewindow: usage timewindow MIN MAX"
+    end if
+    mn = trim(rest[0:sp]); mx = trim(rest[sp+1:])
+    db_append("FS|put|/etc/timerange|" + mn + "|" + mx); vfs_put("/etc/timerange", mn + "|" + mx)
+    log_event("config", "timewindow " + mn + "|" + mx)
+    LAST_OK = 1; return "timewindow " + mn + "|" + mx
+  end if
+
+  // per-mode progress config
+  if startswith(low, "progress") then
+    rest = ""
+    if a.len > 8 then rest = trim(a[8:]) end if
+    if rest == "" then
+      s = "off"; t = "off"
+      if cfg_progress_space() == 1 then s = "on" end if
+      if cfg_progress_time()  == 1 then t = "on" end if
+      LAST_OK = 1
+      return "progress space:" + s + " time:" + t
+    end if
+    sp = indexof(rest, " ")
+    if sp == -1 then
+      LAST_OK = 0
+      return "progress: usage progress [space|time] [on|off]"
+    end if
+    which = trim(rest[0:sp]).lower
+    val   = trim(rest[sp+1:]).lower
+    if which != "space" and which != "time" then
+      LAST_OK = 0; return "progress: usage progress [space|time] [on|off]"
+    end if
+    if val != "on" and val != "off" then
+      LAST_OK = 0; return "progress: usage progress [space|time] [on|off]"
+    end if
+    v = "0"; if val == "on" then v = "1" end if
+    if which == "space" then
+      db_append("FS|put|/etc/progress.space|" + v); vfs_put("/etc/progress.space", v)
+      log_event("config", "progress space=" + val)
+      LAST_OK = 1; return "progress space " + val
+    else
+      db_append("FS|put|/etc/progress.time|" + v); vfs_put("/etc/progress.time", v)
+      log_event("config", "progress time=" + val)
+      LAST_OK = 1; return "progress time " + val
+    end if
+  end if
+
+  // parse -r/--readings anywhere; it toggles from default
+  want_toggle = 0
+  core = a
+  // leading
+  if startswith(low, "-r ") then
+    want_toggle = 1
+    core = trim(a[3:])
+  else if startswith(low, "--readings ") then
+    want_toggle = 1
+    core = trim(a[11:])
+  end if
+  // middle ' -r ' or ' --readings '
+  if want_toggle == 0 then
+    k = indexof(" " + low + " ", " -r ")
+    if k != -1 then
+      want_toggle = 1
+      // remove first ' -r ' occurrence
+      s1 = " " + a + " "
+      j = indexof(s1, " -r ")
+      left = trim(s1[1:j])
+      right = trim(s1[j+4:])
+      if left == "" then
+        core = right
+      else if right == "" then
+          core = left
+        else
+          core = left + " " + right
+      end if
+    end if
+  end if
+  if want_toggle == 0 then
+    k2 = indexof(" " + low, " --readings ")
+    if k2 != -1 then
+      want_toggle = 1
+      s2 = " " + a
+      j2 = indexof(s2, " --readings ")
+      left2 = trim(s2[1:j2])
+      right2 = trim(s2[j2+12:])
+      if left2 == "" then 
+        core = right2
+      else if right2 == "" then
+        core = left2
+      else
+        core = left2 + " " + right2
+      end if
+    end if
+  end if
+  // trailing ' -r' or ' --readings'
+  if want_toggle == 0 then
+    if low.len >= 2 and low[low.len-2:] == " -r" then
+      want_toggle = 1
+      core = trim(a[0:a.len-2])
+    else if low.len >= 11 and low[low.len-11:] == " --readings" then
+      want_toggle = 1
+      core = trim(a[0:a.len-11])
+    end if
+  end if
+
+  target = trim(core).lower
+  if target == "" then
+    LAST_OK = 0
+    return "dial: missing address"
+  end if
+  if target == "somewhere" then
+    core = random_space_addr()
+  else if target == "somewhen" then
+    core = random_time_code()
+  end if
+
+  // decide type and default
+  is_space = 0; is_time = 0
+  if is_space_addr(core) or core.lower == "xxxxx" then is_space = 1 end if
+  if is_time_code(core) then is_time = 1 end if
+  if is_space == 0 and is_time == 0 then
+    LAST_OK = 0
+    return "dial: invalid address"
+  end if
+
+  default_show = 0
+  if is_space == 1 then
+    default_show = cfg_progress_space()
+  else
+    default_show = cfg_progress_time()
+  end if
+  show_readings = default_show
+  if want_toggle == 1 then
+    if show_readings == 1 then
+      show_readings = 0
+    else
+      show_readings = 1
+    end if
+  end if
+
+  PROGRESS_CMD = "dial " + core
+
+  // perform dial
+  connectgate
+  wait 2
+  eta = eta_str_seconds(27)
+
+  // logs
+  if is_space == 1 then
+    log_dial("space", core, show_readings, eta)
+  else
+    log_dial("time", core, show_readings, eta)
+  end if
+
+
+  // space
+  if is_space == 1 then
+    dialgate core
+    if show_readings == 0 then
+      println("ETA " + eta)
+    else if show_readings == 1 then
+      dial_loading_bar(core, eta)
+      clear // gatereadings takes up an entire page 
+      gatereadings()
+    end if
+    PROGRESS_CMD = ""
+    LAST_OK = 1
+    return ""
+  end if
+
+  // time (needs numeric)
+  num = 0; neg = 0; i = 0
+  if core[0] == "-" then neg = 1 end if
+  while i < core.len
+    d = char_to_digit(core[i])
+    if d >= 0 then num = num * 10 + d end if
+    i = i + 1
+  end while
+  if neg == 1 then num = -num end if
+  dialgate num
+  if show_readings == 0 then
+    println("ETA " + eta)
+  else if show_readings == 1 then
+    dial_loading_bar(core, eta)
+    clear // gatereadings takes up an entire page in space, but time is currently broken
+    gatereadings()
+  end if
+  PROGRESS_CMD = ""
+  LAST_OK = 1
+  return ""
+end function
+
+cmd_cardiag = function()
+  cardiag()
+  LAST_OK = 1
+  return ""
+end function
+
+cmd_year = function(arg)
+  a = trim(arg)
+  if a == "" then
+    LAST_OK = 0
+    return "usage: year YEAR"
+  end if
+  y = str_to_int(a)
+  r = cantravel(y)
+  LAST_OK = 1
+  if r == 1 then
+    return "travel to " + str(y) + " IS possible"
+  else
+    return "travel to " + str(y) + " is NOT possible"
+  end if
+end function
+
+// change cantravel to alias year
+cmd_cantravel = function(arg)
+  return cmd_year(arg)
+end function
+
+cmd_timegraph = function()
+  timegraph()
+  LAST_OK = 1
+  return ""
+end function
+
+cmd_hack = function(rest)
+  a = trim(rest).lower
+  if a == "open" then
+    openperipheral()
+    LAST_OK = 1
+    return ""
+  else if a == "close" then
+    closeperipheral()
+    LAST_OK = 1
+    return ""
+  else if a == "mim" then
+    SetFactionMimCore()
+    LAST_OK = 1
+    return ""
+  end if
+  LAST_OK = 0
+  return "hack: usage hack open|close|mim"
+end function
+
+cmd_crab = function(rest)
+  a = trim(rest).lower
+  if a == "" or a == "status" then
+    LAST_OK = 1
+    if cfg_crab() == 1 then
+      return "crab: on"
+    else
+      return "crab: off"
+    end if
+  end if
+  if startswith(a, "help") then
+    flag = ""
+    if indexof(a, "--intrinsic") != -1 or indexof(a, "-i") != -1 then flag = "--intrinsic" end if
+    return cmd_cocohelp(flag)
+  end if
+  if a == "on" then
+    db_append("FS|put|/etc/crab|1")
+    vfs_put("/etc/crab", "1")
+    cococrab()
+    LAST_OK = 1
+    log_event("mode", "crab=on")
+    return "crab: on. This incident will be reported."
+  else if a == "off" then
+    db_append("FS|put|/etc/crab|0")
+    vfs_put("/etc/crab", "0")
+    log_event("mode", "crab=off")
+    LAST_OK = 1
+    return "crab: off"
+  else if a == "toggle" then
+    if cfg_crab() == 1 then
+      return cmd_crab("off")
+    else
+      return cmd_crab("on")
+    end if
+  end if
+  LAST_OK = 0
+  return "crab: usage crab [on|off|toggle|status|help]"
+end function
+
+// alias: coco == crab
+cmd_coco = function(rest)
+  return cmd_crab(rest)
+end function
+
+// Normalize "coco/crab SUB [ARGS]" => "cocoSUB [ARGS]" (but keep mgmt verbs)
+normalize_coco_prefix = function(core)
+  s = trim(core)
+  if s == "" then return core end if
+
+  sp = indexof(s, " ")
+  if sp == -1 then return core end if
+
+  pref = s[0:sp].lower
+  if pref != "coco" and pref != "crab" then return core end if
+
+  rest = trim(s[sp+1:])
+  if rest == "" then return core end if
+
+  // don't fold control verbs
+  sp2 = indexof(rest, " ")
+  head = rest; if sp2 != -1 then head = trim(rest[0:sp2]) end if
+  h = head.lower
+  if h == "on" or h == "off" or h == "toggle" or h == "status" or h == "help" then
+    return core
+  end if
+
+  // name(args) -> name args
+  r2 = rest
+  if r2.len > 0 and r2[r2.len-1] == ")" then
+    k = indexof(r2, "(")
+    if k != -1 then
+      namepart = trim(r2[0:k])
+      argpart  = trim(r2[k+1:r2.len-1])
+      r2 = namepart
+      if argpart != "" then r2 = r2 + " " + argpart end if
+    end if
+  end if
+
+  sp3 = indexof(r2, " ")
+  sub = r2; args = ""
+  if sp3 != -1 then
+    sub = trim(r2[0:sp3])
+    args = trim(r2[sp3+1:])
+  end if
+
+  newcore = "coco" + sub
+  if args != "" then newcore = newcore + " " + args end if
+  return newcore
+end function
+
+args_clean = function(s)
+  out = ""
+  i = 0
+  while i < s.len
+    c = s[i]
+    if c == "," then
+        out = out + " "
+    else
+        out = out + c
+    end if
+    i = i + 1
+  end while
+  return trim(out)
+end function
+
+parse1 = function(s)
+  a = args_clean(s)
+  if a == "" then return "__ERR__" end if
+  return a
+end function
+
+parse2 = function(s)
+  a = args_clean(s)
+  k = indexof(a, " ")
+  if k == -1 then return "__ERR__" end if
+  return a[0:k] + "|" + trim(a[k+1:])
+end function
+
+parse3 = function(s)
+  a = args_clean(s)
+  k1 = indexof(a, " ")
+  if k1 == -1 then return "__ERR__" end if
+  t1 = trim(a[0:k1]); r1 = trim(a[k1+1:])
+  k2 = indexof(r1, " ")
+  if k2 == -1 then return "__ERR__" end if
+  t2 = trim(r1[0:k2]); t3 = trim(r1[k2+1:])
+  if t3 == "" then return "__ERR__" end if
+  return t1 + "|" + t2 + "|" + t3
+end function
+
+// --- helpers for coco/crab parsing ---
+get_call_args = function(core, name)
+  low = core.lower
+  nlen = name.len
+
+  // "(...)" form
+  if startswith(low, name + "(") then
+    if core[core.len-1] == ")" then
+      return trim(core[nlen+1:core.len-1])
+    end if
+  end if
+
+  // " " form
+  if startswith(low, name + " ") then
+    return trim(core[nlen+1:])
+  end if
+
+  return ""
+end function
+
+cmd_cocohelp = function(rest)
+  r = trim(rest).lower
+  if r == "--intrinsic" or r == "-i" then
+    x = run_intrinsic("cocohelp","")
+    if x == "__NOINTRINSIC__" then
+      x = run_intrinsic("crabhelp","")
+    end if
+    return x
+  end if
+
+  nl = char(10)
+  q = char(34)
+
+  h = "Car be heal: cocorepair" + nl
+  h = h + "Money be... cocodollar 200" + nl
+  h = h + "Shilling...     cocoshilling 200" + nl
+  h = h + "Time 1-360 cocotime 200" + nl
+  h = h + "Day:            cocoday 11" + nl
+  h = h + "Month:       cocomonth 5" + nl
+  h = h + "Year:           cocoyear 1996" + nl
+  h = h + "Default Time Speed:              cocospeed 4.0" + nl
+  h = h + "NEXT PAGE ANY KEY...." + nl + nl
+  h = h + "Quest Stage id 21 set to accepted..." + nl
+  h = h + "  cocoquest 21, " + q + "accepted" + q + nl
+  h = h + "    accepted,finished,invisible,inactive" + nl
+  h = h + "    Quest id 21 set to progress 9..." + nl
+  h = h + "    cocoqprogress 21,9" + nl + nl
+  h = h + "Get quest progress: cocogetq" + nl
+  h = h + "Get quest name:      cocogetqname"
+
+  LAST_OK = 1
+  return h
+end function
+
+cmd_coco_dispatch = function(core)
+  // let management verbs be handled outside
+  lo0 = trim(core).lower
+  spm = indexof(lo0, " ")
+  if spm != -1 then
+    pfx = lo0[0:spm]
+    if pfx == "coco" or pfx == "crab" then
+      head = trim(lo0[spm+1:])
+      spm2 = indexof(head, " "); if spm2 != -1 then head = trim(head[0:spm2]) end if
+      h = head.lower
+      if h == "on" or h == "off" or h == "toggle" or h == "status" or h == "help" then
+        return "__NOMATCH__"
+      end if
+    end if
+  end if
+
+  // If it's not a coco*/crab* command, let the normal dispatcher handle it.
+  t = trim(core).lower
+  if not startswith(t, "coco") and not startswith(t, "crab") then
+    return "__NOMATCH__"
+  end if
+
+
+  // FIRST lines inside cmd_coco_dispatch, before `low = core.lower`
+  // Canonicalize: "coco SUB …" or "crab SUB …" -> "cocoSUB …"
+  s0 = trim(core)
+  sp0 = indexof(s0, " ")
+  if sp0 != -1 then
+    pref0 = s0[0:sp0].lower
+    if pref0 == "coco" or pref0 == "crab" then
+      r = trim(s0[sp0+1:])
+      // allow "name(args)" form
+      if r.len > 0 and r[r.len-1] == ")" then
+        k0 = indexof(r, "(")
+        if k0 != -1 then
+          namepart = trim(r[0:k0])
+          argpart  = trim(r[k0+1:r.len-1])
+          if argpart != "" then
+            r = namepart + " " + argpart
+          else
+            r = namepart
+          end if
+        end if
+      end if
+      sp1 = indexof(r, " ")
+      sub = r; args = ""
+      if sp1 != -1 then
+        sub  = trim(r[0:sp1])
+        args = trim(r[sp1+1:])
+      end if
+      core = "coco" + sub
+      if args != "" then
+      core = core + " " + args
+      end if
+    end if
+  end if
+  low = core.lower
+
+  // help aliases
+  if low == "cocohelp" then
+    return cmd_cocohelp("")
+  end if
+  if startswith(low, "cocohelp ") then
+    return cmd_cocohelp(trim(core[8:]))
+  end if
+  if low == "crabhelp" then
+    return cmd_cocohelp("")
+  end if
+  if startswith(low, "crabhelp ") then
+    return cmd_cocohelp(trim(core[8:]))
+  end if
+
+  // cococrab direct call, avilable without cfg_config
+  if low == "cococrab" then
+    cococrab()
+    LAST_OK = 1
+    return ""
+  end if
+
+
+  // block cheats when off (below help aliases so crab help is still allowed)
+  if cfg_crab() == 0 then
+    LAST_OK = 0
+    return "crab: off"
+  end if
+
+  // cocotransport x y z
+  args = get_call_args(core, "cocotransport")
+  if args != "" then
+    p = parse3(args)
+    if p == "__ERR__" then
+      LAST_OK = 0
+      return "usage: cocotransport X Y Z"
+    end if
+    a = indexof(p,"|")
+    b = indexof(p[a+1:], "|")
+    if b != -1 then
+      b = a + 1 + b
+    end if
+    x = p[0:a]
+    y = p[a+1:b]
+    z = p[b+1:]
+    cocotransport x, y, z
+    LAST_OK = 1
+    return ""
+  end if
+
+  // cococarport x y z
+  args = get_call_args(core, "cococarport")
+  if args != "" then
+    p = parse3(args)
+    if p == "__ERR__" then
+      LAST_OK = 0
+      return "usage: cococarport X Y Z"
+    end if
+    a = indexof(p,"|")
+    b = indexof(p[a+1:], "|")
+    if b != -1 then
+      b = a + 1 + b
+    end if
+    x = p[0:a]
+    y = p[a+1:b]
+    z = p[b+1:]
+    cococarport x, y, z
+    LAST_OK = 1
+    return ""
+  end if
+
+  // zero-arg cheats
+  if low == "cocolevels" then
+    cocolevels(); LAST_OK=1
+    return ""
+  end if
+  if low == "cocoheal" then
+    cocoheal()
+    LAST_OK=1
+    return ""
+  end if
+  if low == "cocorads" then
+    cocorads()
+    LAST_OK=1
+    return ""
+  end if
+  if low == "cocoitems" then
+    cocoitems()
+    LAST_OK=1
+    return ""
+  end if
+  if low == "cocoheataway" then
+    cocoheataway()
+    LAST_OK=1
+    return ""
+  end if
+  if low == "cocorepair" then
+    cocorepair()
+    LAST_OK=1
+    return ""
+  end if
+  if low == "cocofly" then
+    cocofly()
+    LAST_OK=1
+    return ""
+  end if
+  if low == "cocosave" then
+    cocosave()
+    LAST_OK=1
+    return ""
+  end if
+
+  // one-arg cheats
+  args = get_call_args(core, "cocolevel")
+  if args != "" then
+    v = parse1(args)
+    if v == "__ERR__" then
+      LAST_OK = 0
+      return "usage: cocolevel ID"
+    end if
+    cocolevel v
+    LAST_OK = 1
+    return ""
+  end if
+
+  args = get_call_args(core, "cocogive")
+  if args != "" then
+    v = parse1(args)
+    if v == "__ERR__" then
+      LAST_OK = 0
+      return "usage: cocogive ID"
+    end if
+    cocogive v
+    LAST_OK = 1
+    return ""
+  end if
+
+  // --- cocodollar ---
+  if low == "cocodollar" then
+    LAST_OK = 0; return "usage: cocodollar AMOUNT"
+  end if
+  args = get_call_args(core, "cocodollar")
+  if args != "" then
+    v = parse1(args)
+    if v == "__ERR__" then
+        LAST_OK=0
+        return "usage: cocodollar AMOUNT"
+    end if
+    cocodollar to_number(v)
+    LAST_OK = 1
+    return ""   // change to "ok" if you want confirmation
+  end if
+
+  // --- cocoshilling ---
+  if low == "cocoshilling" then
+    LAST_OK = 0; return "usage: cocoshilling AMOUNT"
+  end if
+  args = get_call_args(core, "cocoshilling")
+  if args != "" then
+    v = parse1(args)
+    if v == "__ERR__" then
+        LAST_OK=0
+        return "usage: cocoshilling AMOUNT"
+    end if
+    cocoshilling to_number(v)
+    LAST_OK = 1
+    return ""
+  end if
+
+  // --- cocoimperial ---
+  if low == "cocoimperial" then
+    LAST_OK = 0; return "usage: cocoimperial AMOUNT"
+  end if
+  args = get_call_args(core, "cocoimperial")
+  if args != "" then
+    v = parse1(args)
+    if v == "__ERR__" then
+        LAST_OK=0
+        return "usage: cocoimperial AMOUNT"
+    end if
+    cocoimperial to_number(v)
+    LAST_OK = 1
+    return ""
+  end if
+
+  // --- cocoancient ---
+  if low == "cocoancient" then
+    LAST_OK = 0; return "usage: cocoancient AMOUNT"
+  end if
+  args = get_call_args(core, "cocoancient")
+  if args != "" then
+    v = parse1(args)
+    if v == "__ERR__" then
+        LAST_OK=0
+        return "usage: cocoancient AMOUNT"
+    end if
+    cocoancient to_number(v)
+    LAST_OK = 1
+    return ""
+  end if
+
+  args = get_call_args(core, "cocotime")
+  if args != "" then
+    v = parse1(args)
+    if v == "__ERR__" then
+      LAST_OK = 0
+      return "usage: cocotime DEGREES"
+    end if
+    cocotime v
+    LAST_OK = 1
+    return ""
+  end if
+
+  args = get_call_args(core, "cocoday")
+  if args != "" then
+    v = parse1(args)
+    if v == "__ERR__" then
+      LAST_OK = 0
+      return "usage: cocoday DAY"
+    end if
+    cocoday v
+    LAST_OK = 1
+    return ""
+  end if
+
+  args = get_call_args(core, "cocomonth")
+  if args != "" then
+    v = parse1(args)
+    if v == "__ERR__" then
+      LAST_OK = 0
+      return "usage: cocomonth MONTH"
+    end if
+    cocomonth v
+    LAST_OK = 1
+    return ""
+  end if
+
+  args = get_call_args(core, "cocoyear")
+  if args != "" then
+    v = parse1(args)
+    if v == "__ERR__" then
+      LAST_OK = 0
+      return "usage: cocoyear YEAR"
+    end if
+    cocoyear v
+    LAST_OK = 1
+    return ""
+  end if
+
+  args = get_call_args(core, "cocospeed")
+  if args != "" then
+    v = parse1(args)
+    if v == "__ERR__" then
+      LAST_OK = 0
+      return "usage: cocospeed VALUE"
+    end if
+    cocospeed v
+    LAST_OK = 1
+    return ""
+  end if
+
+  // two-arg cheats
+  args = get_call_args(core, "cocoquest")
+  if args != "" then
+    p2 = parse2(args)
+    if p2 == "__ERR__" then
+      LAST_OK = 0
+      return "usage: cocoquest ID STATUS"
+    end if
+    k = indexof(p2,"|")
+    a1 = p2[0:k]
+    a2 = p2[k+1:]
+    cocoquest a1, a2
+    LAST_OK = 1
+    return ""
+  end if
+
+  args = get_call_args(core, "cocoqprogress")
+  if args != "" then
+    p2 = parse2(args)
+    if p2 == "__ERR__" then
+      LAST_OK = 0
+      return "usage: cocoqprogress ID PROGRESS"
+    end if
+    k = indexof(p2,"|")
+    a1 = p2[0:k]
+    a2 = p2[k+1:]
+    cocoqprogress a1, a2
+    LAST_OK = 1
+    return ""
+  end if
+
+  args = get_call_args(core, "cocogetq")
+  if args != "" then
+    v = parse1(args)
+    if v == "__ERR__" then
+      LAST_OK = 0
+      return "usage: cocogetq ID"
+    end if
+    cocogetq v
+    LAST_OK = 1
+    return ""
+  end if
+
+  args = get_call_args(core, "cocogetqname")
+  if args != "" then
+    v = parse1(args)
+    if v == "__ERR__" then
+      LAST_OK = 0
+      return "usage: cocogetqname ID"
+    end if
+    cocogetqname v
+    LAST_OK = 1
+    return ""
+  end if
+
+  return "__NOMATCH__"
+end function
+
+cmd_temp = function()
+  res = _dev_read("/dev/sensors/temp")
+  if res.len >= 4 and res[0:4] == "dev:" then
+    LAST_OK = 0
+  else
+    LAST_OK = 1
+  end if
+  return res
+end function
+
+cmd_write = function(rest)
+  r = trim(rest)
+  sp = indexof(r, " ")
+  if sp == -1 then
+    LAST_OK = 0
+    return "write: usage write FILE TEXT"
+  end if
+  p = normalize_path(r[0:sp])
+  txt = trim(r[sp+1:])
+  if txt.len >= 2 and txt[0] == char(34) and txt[txt.len-1] == char(34) then
+    txt = unescape(txt[1:txt.len-1])
+  end if
+  if vfs_exists_dir(parent_path(p)) == 0 then
+    LAST_OK = 0
+    return "write: parent missing"
+  end if
+  db_append("FS|put|" + p + "|" + escape_str(txt))
+  vfs_put(p, txt)
+  log_event("fs", "write " + p + " bytes=" + str(txt.len))
+
+  LAST_OK = 1
+  return "wrote " + p
+end function
+
+cmd_fsck = function()
+  idx_reset()
+  db_set_indexed(0)
+  rebuild_vfs()
+  LAST_OK = 1
+  log_event("maintenance", "fsck")
+  return "fsck: rebuilt index"
+end function
+
+cmd_help = function(arg)
+  nl = char(10); a = trim(arg)
+  h = "Commands:" + nl
+  h = h + "  pwd | cd DIR | ls [DIR] | cat FILE" + nl
+  h = h + "  echo [-n] TEXT [> FILE | >> FILE] | write FILE TEXT" + nl
+  h = h + "  mkdir DIR | rm [-r] PATH | mv SRC DST | touch FILE" + nl
+  h = h + "  cp SRC DST | rmdir DIR | head [-n N] FILE | tail [-n N|-f] FILE" + nl
+  h = h + "  wc FILE | grep PATTERN FILE | find DIR | date | clear" + nl
+  h = h + "  history [N] | fsck | vacuum | sleep N | which CMD | version" + nl
+  h = h + "  dial ... (see: dial help)" + nl
+  h = h + "  temp | cardiag (alias: car) | year YEAR (alias: cantravel) | timegraph" + nl
+  h = h + "Files: /etc/progress 0|1; /etc/timerange MIN|MAX ; /var/log/history" + nl
+  LAST_OK = 1
+  if a == "-p" then
+    // write to temp and invoke less
+    vfs_put("/tmp/.help", h)
+    return cmd_less("/tmp/.help")
+  end if
+  return h
+end function
+
+// --- Parser helpers ---------------
+parse_redirect = function(line)
+  // returns: core|mode|target   (mode: 0 none, 1 '>', 2 '>>')
+  core = line
+  mode = 0
+  target = ""
+  i = 0
+  inq = 0
+  esc = 0
+  while i < line.len
+    c = line[i]
+    if inq == 1 then
+      if esc == 1 then
+        esc = 0
+      else
+        if c == char(92) then
+          esc = 1
+        else if c == char(34) then
+          inq = 0
+        end if
+      end if
+    else
+      if c == char(34) then
+        inq = 1
+      else if c == ">" then
+        if i + 1 < line.len and line[i+1] == ">" then
+          mode = 2
+        else
+          mode = 1
+        end if
+        core = trim(line[0:i])
+        j = i + 1
+        if mode == 2 then
+          j = i + 2
+        end if
+        while j < line.len and line[j] == " "
+          j = j + 1
+        end while
+        target = trim(line[j:])
+        return core + "|" + str(mode) + "|" + target
+      end if
+    end if
+    i = i + 1
+  end while
+  return core + "|0|"
+end function
+
+// Execute a single command and either print or redirect
+run_single = function(line)
+  raw = trim(line)
+  pr = parse_redirect(raw)
+
+  a = indexof(pr, "|")
+  b = indexof(pr[a+1:], "|")
+  if b != -1 then
+    b = a + 1 + b
+  end if
+
+  core = pr[0:a]
+  mode_s = pr[a+1:b]
+  target = pr[b+1:]
+  core = normalize_coco_prefix(core)
+
+  mode = 0
+  if mode_s != "" then
+    mode = char_to_digit(mode_s[0])
+  end if
+
+  out = ""
+
+  // dialgate(X) or dialgate X -> intrinsic safely
+  if core.len >= 10 and core[core.len-1] == ")" and startswith(core, "dialgate(") then
+    out = run_intrinsic("dialgate", trim(core[9:core.len-1]))
+  else if startswith(core, "dialgate ") then
+    out = run_intrinsic("dialgate", trim(core[9:]))
+  else
+    tmp = cmd_coco_dispatch(core)
+    if tmp != "__NOMATCH__" then
+      out = tmp
+    else
+      // ... keep your existing big dispatch chain from here down ...
+      // (no changes needed below this comment)
+      if startswith(core, "pwd") then
+        out = cmd_pwd()
+      else if startswith(core, "cd ") then
+        out = cmd_cd(trim(core[3:]))
+      else if core == "cd" then
+        out = cmd_cd("")
+      else if startswith(core, "ls ") then
+        out = cmd_ls(trim(core[3:]))
+      else if core == "ls" then
+        out = cmd_ls("")
+      else if startswith(core, "cat ") then
+        out = cmd_cat(trim(core[4:]))
+      else if startswith(core, "echo ") then
+        out = cmd_echo(core[5:])
+      else if core == "echo" then
+        out = ""
+        LAST_OK = 1
+      else if startswith(core, "mkdir ") then
+        out = cmd_mkdir(trim(core[6:]))
+      else if startswith(core, "rm ") then
+        out = cmd_rm(trim(core[3:]))
+      else if startswith(core, "mv ") then
+        rest = trim(core[3:])
+        sp = indexof(rest, " ")
+        if sp == -1 then
+          out = "mv: missing args"
+          LAST_OK = 0
+        else
+          out = cmd_mv(trim(rest[0:sp]), trim(rest[sp+1:]))
+        end if
+      else if startswith(core, "touch ") then
+        out = cmd_touch(trim(core[6:]))
+      else if startswith(core, "dial ") then
+        out = cmd_dial(trim(core[5:]))
+      else if core == "cardiag" then
+        out = cmd_cardiag()
+      else if core == "car" then
+        out = cmd_cardiag()
+      else if startswith(core, "year ") then
+        out = cmd_year(trim(core[5:]))
+      else if startswith(core, "cantravel ") then
+        out = cmd_cantravel(trim(core[10:]))
+      else if core == "timegraph" then
+        out = cmd_timegraph()
+      else if startswith(core, "hack ") then
+        out = cmd_hack(trim(core[5:]))
+      else if core == "hack" then
+        out = cmd_hack("")
+      else if core == "temp" then
+        out = cmd_temp()
+      else if startswith(core, "less ") then
+        out = cmd_less(trim(core[5:]))
+      else if core == "help" then
+        out = cmd_help("")
+      else if startswith(core, "help ") then
+        out = cmd_help(trim(core[5:]))
+      else if core == "fsck" then
+        out = cmd_fsck()
+      else if startswith(core, "write ") then
+        out = cmd_write(trim(core[6:]))
+      else if core == "quit" or core == "exit" then
+        running = false
+        LAST_OK = 1
+        out = ""
+      else if startswith(core, "cp ") then
+        rest = trim(core[3:])
+        sp = indexof(rest, " ")
+        if sp == -1 then
+          out = "cp: missing args"
+          LAST_OK = 0
+        else
+          out = cmd_cp(trim(rest[0:sp]), trim(rest[sp+1:]))
+        end if
+      else if startswith(core, "rmdir ") then
+        out = cmd_rmdir(trim(core[6:]))
+      else if startswith(core, "head ") then
+        out = cmd_head(trim(core[5:]))
+      else if startswith(core, "tail ") then
+        out = cmd_tail(trim(core[5:]))
+      else if startswith(core, "sleep ") then
+        out = cmd_sleep(trim(core[6:]))
+      else if core == "true" then
+        out = cmd_true()
+      else if core == "false" then
+        out = cmd_false()
+      else if startswith(core, "which ") then
+        out = cmd_which(trim(core[6:]))
+      else if core == "version" or core == "mud --version" then
+        out = cmd_version()
+      else if startswith(core, "wc ") then
+        out = cmd_wc(trim(core[3:]))
+      else if startswith(core, "grep ") then
+        out = cmd_grep(trim(core[5:]))
+      else if startswith(core, "find ") then
+        out = cmd_find(trim(core[5:]))
+      else if core == "date" then
+        out = cmd_date()
+      else if core == "clear" then
+        out = cmd_clear()
+      else if core == "vacuum" then
+        out = cmd_vacuum()
+      else if startswith(core, "history") then
+        arg = ""
+        if core.len > 7 then
+          arg = trim(core[7:])
+        end if
+        out = cmd_history(arg)
+      else if startswith(core, "crab ") then
+        out = cmd_crab(trim(core[5:]))
+      else if core == "crab" then
+        out = cmd_crab("")
+      else if startswith(core, "coco ") then
+        out = cmd_coco(trim(core[5:]))
+      else if core == "coco" then
+        out = cmd_coco("")
+      else
+        out = "unknown command"
+        LAST_OK = 0
+      end if
+    end if
+  end if
+
+  // audit each command run
+  log_event("cmd", "ok=" + str(LAST_OK) + " | " + core)
+
+  // redirection handling (unchanged)
+  if mode == 0 then
+    if out != "" then
+      println(out)
+    end if
+  else
+    if target == "" then
+      println("redirect: missing path")
+      LAST_OK = 0
+      return
+    end if
+    p = normalize_path(target)
+    if startswith(p, "/dev/") then
+      devres = _dev_write(p, out)
+      if devres != "" then
+        println(devres)
+      end if
+      if devres.len >= 5 and (devres[0:5] == "dial:" or devres[0:4] == "dev:") then
+        LAST_OK = 0
+      else
+        LAST_OK = 1
+      end if
+      return
+    end if
+    if mode == 1 then
+      db_append("FS|put|" + p + "|" + escape_str(out))
+      vfs_put(p, out)
+    else
+      db_append("FS|append|" + p + "|" + escape_str(out))
+      vfs_append(p, out)
+    end if
+  end if
+end function
+
+// Execute a possibly chained line: supports ';' and '&&'
+history_log = function(cmd)
+  if trim(cmd) == "" then
+    return
+  end if
+  vfs_touch("/var/log/history")
+  db_append("FS|append|/var/log/history|" + escape_str(cmd + char(10)))
+  vfs_append("/var/log/history", cmd + char(10))
+end function
+
+run_chain = function(line)
+  s = line
+  i = 0
+  inq = 0
+  esc = 0
+  buf = ""
+  shortcircuit = 0  // skip until next ';' after a failed &&
+  while i < s.len
+    c = s[i]
+    if inq == 1 then
+      buf = buf + c
+      if esc == 1 then
+        esc = 0
+      else
+        if c == char(92) then
+          esc = 1
+        else if c == char(34) then
+          inq = 0
+        end if
+      end if
+      i = i + 1
+    else
+      if c == char(34) then
+        inq = 1
+        buf = buf + c
+        i = i + 1
+      else if c == ";" then
+        if shortcircuit == 0 then
+          history_log(trim(buf))
+          run_single(buf)
+        end if
+        buf = ""
+        shortcircuit = 0
+        i = i + 1
+      else if c == "&" then
+        if i + 1 < s.len and s[i+1] == "&" then
+          if shortcircuit == 0 then
+            history_log(trim(buf))
+            run_single(buf)
+          end if
+          if LAST_OK == 0 then
+            shortcircuit = 1
+          end if
+          buf = ""
+          i = i + 2
+        else
+          buf = buf + c
+          i = i + 1
+        end if
+      else
+        buf = buf + c
+        i = i + 1
+      end if
+    end if
+  end while
+  if trim(buf) != "" then
+    if shortcircuit == 0 then
+      history_log(trim(buf))
+      run_single(buf)
+    end if
+  end if
+end function
+
+// --- Boot & REPL ------------------
+main = function()
+  ensure_db()
+  seed_if_empty()
+  rebuild_vfs()
+  boot_screen()
+  while running
+    line = readline
+    s = trim(line)
+    if s != "" then
+      LAST_CMD = s
+      clear
+      ui_header(s)
+    end if
+    run_chain(line)
+    yield
+  end while
+  // optional: keep vfs.map for debugging
+end function
+
+main
+
