@@ -323,6 +323,7 @@ G_ALERT = 100
 // accumulators (not saved)
 G_ACC_K = 0; G_ACC_W = 0; G_ACC_A = 0
 G_ACC_REGEN = 0; G_ACC_STARVE = 0
+G_ACC_EXH = 0  // exhaustion: add cost while alert ≤20; +1 idle tick per 200
 
 // status latches to avoid spam
 G_S_HUNGRY = 0; G_S_STARVING = 0; G_S_THIRST = 0; G_S_DEHY = 0; G_S_VT = 0; G_S_EXH = 0
@@ -331,12 +332,22 @@ cr_clamp = function(x, lo, hi); if x < lo then return lo; if x > hi then return 
 cr_fmt1 = function(x); return str(cr_idiv(x*10,1)/10); end function
 
 cr_speed_mul = function()
-  m = 1.0
-  if G_KCAL < 800 then m = m * 0.9
-  if G_KCAL < 300 then m = m * 0.75
-  if G_WATER < 0.5 then m = m * 0.9
-  if G_WATER < 0.25 then m = m * 0.8
-  return m
+  // worst-of per axis, then multiply axes
+  // hunger axis
+  mH = 1.0
+  if G_KCAL < 300 then
+    mH = 0.75
+  else if G_KCAL < 800 then
+    mH = 0.9
+  end if
+  // water axis
+  mW = 1.0
+  if G_WATER < 0.25 then
+    mW = 0.8
+  else if G_WATER < 0.5 then
+    mW = 0.9
+  end if
+  return mH * mW
 end function
 
 cr_cost_adj = function(baseTurns)
@@ -392,7 +403,7 @@ end function
 
 // cr_pools_tick — direct global reads/writes (search: cr_pools_tick — direct)
 cr_pools_tick = function(mode, dt, hp, status)
-  // Use globals directly
+  // sync globals snapshot
   globals.G_ACC_K = G_ACC_K; globals.G_ACC_W = G_ACC_W; globals.G_ACC_A = G_ACC_A
   globals.G_ACC_REGEN = G_ACC_REGEN; globals.G_ACC_STARVE = G_ACC_STARVE
 
@@ -418,8 +429,7 @@ cr_pools_tick = function(mode, dt, hp, status)
   // water −0.01 per wT
   if wT > 0 then
     globals.G_ACC_W = G_ACC_W + dt
-    dw_ticks = G_ACC_W / wT
-    dw = floor(dw_ticks)
+    dw = cr_idiv(G_ACC_W, wT)
     if dw > 0 then
       globals.G_WATER = G_WATER - (dw * 0.01)
       if G_WATER < 0 then globals.G_WATER = 0
@@ -427,7 +437,7 @@ cr_pools_tick = function(mode, dt, hp, status)
     end if
   end if
 
-  // alert ±1 per aT - FIXED
+  // alert ±1 per aT
   if aT > 0 then
     globals.G_ACC_A = G_ACC_A + dt
     da = cr_idiv(G_ACC_A, aT)
@@ -437,24 +447,24 @@ cr_pools_tick = function(mode, dt, hp, status)
     end if
   end if
 
-  // starvation −1 HP per STARVE_HP_T when kcal==0 or water==0 - FIXED
+  // starvation −1 HP per STARVE_HP_T when kcal==0 or water==0
   if (G_KCAL <= 0 or G_WATER <= 0) and STARVE_HP_T > 0 then
     globals.G_ACC_STARVE = G_ACC_STARVE + dt
     ds = cr_idiv(G_ACC_STARVE, STARVE_HP_T)
     if ds > 0 then
-      hp = hp - ds
-      if hp < 0 then hp = 0
+      hp = hp - ds; if hp < 0 then hp = 0
       globals.G_ACC_STARVE = G_ACC_STARVE - ds * STARVE_HP_T
     end if
   end if
 
-  // regen only during sleep with gate open
-  if mode == "sleep" and G_KCAL >= HUNGER_GATE and hp > 0 and hp < HP_MAX_DEFAULT then
-    globals.G_ACC_REGEN = G_ACC_REGEN + dt * REGEN_SLEEP_X
+  // regen: always on when gate is open; sleep ×2
+  if G_KCAL >= HUNGER_GATE and hp > 0 and hp < HP_MAX_DEFAULT then
+    rx = 1
+    if mode == "sleep" then rx = rx * REGEN_SLEEP_X
+    globals.G_ACC_REGEN = G_ACC_REGEN + dt * rx
     dr = cr_idiv(G_ACC_REGEN, REGEN_T)
     if dr > 0 then
-      hp = hp + dr
-      if hp > HP_MAX_DEFAULT then hp = HP_MAX_DEFAULT
+      hp = hp + dr; if hp > HP_MAX_DEFAULT then hp = HP_MAX_DEFAULT
       globals.G_ACC_REGEN = G_ACC_REGEN - dr * REGEN_T
     end if
   end if
@@ -481,38 +491,98 @@ cr_any_enemy_visible = function(enemies, px, py)
   return 0
 end function
 
-// central time step that also advances pools
+// central time step that also advances pools and handles exhaustion skip
 cr_do_time = function(mode, baseCost, map, enemies, px, py, tick, hp, status)
   cost = cr_cost_adj(baseCost)
+
+  // enemies act up to goal
   goal = tick + cost
   r = cr_enemies_process(map, enemies, px, py, goal, status)
   status = r[0]; hp = hp - r[1]; if hp < 0 then hp = 0
   tick = goal
+
+  // pools for this step
   t2 = cr_pools_tick(mode, cost, hp, status)
   hp = t2[0]; status = t2[1]
+
+  // exhaustion: at alert ≤20, every 200 turns lose 1 extra idle tick
+  if G_ALERT <= 20 then
+    globals.G_ACC_EXH = G_ACC_EXH + cost
+    while G_ACC_EXH >= 200
+      // enemies advance one more tick
+      rE = cr_enemies_process(map, enemies, px, py, tick + 1, status)
+      status = rE[0]; hp = hp - rE[1]; if hp < 0 then hp = 0
+      tick = tick + 1
+      tE = cr_pools_tick("idle", 1, hp, status)
+      hp = tE[0]; status = tE[1]
+      globals.G_ACC_EXH = G_ACC_EXH - 200
+    end while
+  end if
+
   return [tick, hp, status]
 end function
 
-cr_sleep_block = function(map, enemies, px, py, tick, hp, status)
-  if cr_any_enemy_visible(enemies, px, py) then
-    status = "You can't sleep while visible."
+// replace old cr_sleep_or_rest
+cr_sleep_or_rest = function(map, enemies, px, py, floorN, var, tick, hp, hpMax, status)
+  // SLEEP: only if tired and unseen; heals at ×2
+  if G_ALERT < 100 then
+    if cr_any_enemy_visible(enemies, px, py) then
+      status = "You can't sleep while visible."
+      return [tick, hp, status, 0]
+    end if
+    interrupted = 0
+    cr_draw_loading("F" + str(floorN) + var, "Sleeping...")
+    while G_ALERT < 100 and hp > 0
+      r = cr_do_time("sleep", 25, map, enemies, px, py, tick, hp, status)
+      tick = r[0]; hp = r[1]; status = r[2]
+      if hp <= 0 then break
+      if cr_any_enemy_visible(enemies, px, py) then interrupted = 1; break
+    end while
+    if hp > 0 then
+      if interrupted then status = "You wake, interrupted." else status = "You feel rested."
+    end if
+    return [tick, hp, status, 1]
+  end if
+
+  // REST: alert full; idle until fully healed or no healing possible
+  if hp >= hpMax then
+    status = "You are fully alert."
     return [tick, hp, status, 0]
   end if
-  // sleep until alert 100 or interrupted
-  interrupted = 0
-  while G_ALERT < 100 and hp > 0
-    // step in moderate chunks so enemies can act
-    step = 25
-    res = cr_do_time("sleep", step, map, enemies, px, py, tick, hp, status)
-    tick = res[0]; hp = res[1]; status = res[2]
+
+  cr_draw_loading("F" + str(floorN) + var, "Resting...")
+  lastHp = hp
+  noProg = 0            // turns since last HP gain
+  CUT = 500             // stop if no healing progress over this many turns
+
+  while hp < hpMax and hp > 0
+    r2 = cr_do_time("idle", 25, map, enemies, px, py, tick, hp, status)
+    tick = r2[0]; hp = r2[1]; status = r2[2]
     if hp <= 0 then break
-    if cr_any_enemy_visible(enemies, px, py) then interrupted = 1; break
+
+    // progress tracking
+    if hp > lastHp then
+      lastHp = hp
+      noProg = 0
+    else
+      noProg = noProg + 25
+      if noProg >= CUT then
+        status = "You can't heal while hungry."
+        break
+      end if
+    end if
+
+    // optional safety: break if something wanders in; rest doesn't require unseen
+    if cr_any_enemy_visible(enemies, px, py) then
+      status = "You stop resting."
+      break
+    end if
   end while
-  if hp > 0 then
-    if interrupted then status = "You wake, interrupted." else status = "You feel rested."
-  end if
+
+  if hp > 0 and hp >= lastHp and noProg < CUT then status = "You feel better."
   return [tick, hp, status, 1]
 end function
+
 
 cr_list_join = function(lst, sep)
   out = ""
@@ -1092,7 +1162,7 @@ cr_draw = function(level, enemies, items, px, py, floorN, var, tick, hp, hpMax, 
 
   R = []
   R.push("F" + str(floorN) + var + " T" + str(tick))
-  R.push("HP " + str(hp) + "/" + str(hpMax) + cr_bar10(hp, hpMax))
+  R.push("HP " + str(hp) + " " + cr_bar10(hp, hpMax))
   if statusMsg == null then R.push("") else R.push(cr_pad(statusMsg, CR_RIGHT_W))
   R.push(cr_pad(cr_items_near(items, px, py), CR_RIGHT_W))
 
@@ -1571,6 +1641,16 @@ end if
       cr_draw(level, enemies, items, px, py, floorN, var, tick, hp, hpMax, lvl, xp, xpNext, status, footer)
       continue
     end if
+
+    // sleep or rest
+    if key == "s" then
+      res = cr_sleep_or_rest(map, enemies, px, py, floorN, var, tick, hp, hpMax, status)
+      tick = res[0]; hp = res[1]; status = res[2]
+      cr_draw(level, enemies, items, px, py, floorN, var, tick, hp, hpMax, lvl, xp, xpNext, status, footer)
+      continue
+    end if
+
+
 
     // movement / waits / attacks
     mv = cr_key_to_move(key)

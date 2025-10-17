@@ -1,5 +1,6 @@
 #include crawl.mud
 
+
 // crawl_test.eee — headless unit tests
 // ---- tiny harness ----
 OUT = []; TESTS = 0; FAILS = 0  // not trusted for totals; we’ll derive from OUT
@@ -12,6 +13,7 @@ t_reset = function()
   globals.G_KCAL = 1200; globals.G_WATER = 1.0; globals.G_ALERT = 100
   globals.G_ACC_K = 0; globals.G_ACC_W = 0; globals.G_ACC_A = 0
   globals.G_ACC_REGEN = 0; globals.G_ACC_STARVE = 0
+  globals.G_ACC_EXH = 0
   globals.G_S_HUNGRY = 0; globals.G_S_STARVING = 0; globals.G_S_THIRST = 0; globals.G_S_DEHY = 0; globals.G_S_VT = 0; globals.G_S_EXH = 0
 end function
 
@@ -170,6 +172,28 @@ test_step_toward = function()
   t_eq("step_toward straight", cr_xy_to_str(s[0],s[1]), "2:2")
 end function
 
+test_regen_awake_gate = function()
+  t_reset(); globals.G_KCAL = 800; hp = 98
+  r = cr_pools_tick("idle", 100, hp, ""); t_eq("regen +1 /100 awake", r[0], 99)
+  t_reset(); globals.G_KCAL = 799; hp = 98
+  r2 = cr_pools_tick("idle", 100, hp, ""); t_eq("no regen when kcal<800", r2[0], 98)
+end function
+
+test_speed_mul = function()
+  t_reset(); t_eq("cost no debuff", cr_cost_adj(10), 10)
+  t_reset(); globals.G_KCAL = 250; t_eq("cost starving 0.75", cr_cost_adj(10), 14)
+  t_reset(); globals.G_WATER = 0.24; t_eq("cost dehydrated 0.8", cr_cost_adj(10), 13)
+  t_reset(); globals.G_KCAL = 250; globals.G_WATER = 0.24
+  t_eq("cost starving+dehydrated", cr_cost_adj(10), 17)
+end function
+
+test_exhaustion_skip = function()
+  t_reset(); globals.G_ALERT = 20
+  m = cr_blank_map(); enemies = []
+  r = cr_do_time("idle", 200, m, enemies, 2, 2, 0, 50, "")
+  t_eq("exhaust skip adds 1", r[0], 201)
+end function
+
 // ---- entry ----
 crawl_test_main = function()
   t_line("Running crawl tests")
@@ -183,6 +207,9 @@ crawl_test_main = function()
   test_enemy_commit()
   test_find_free_dot()
   test_step_toward()
+  test_regen_awake_gate()
+  test_speed_mul()
+  test_exhaustion_skip()
   t_line("")
   // derive totals from OUT to avoid scope issues
   total = 0; fails = 0; i = 0
