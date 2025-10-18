@@ -330,42 +330,49 @@ end function
 cr_clock_init = function(tick)
   globals.CR_LAST_CLOCK_TICK = tick
   total_cs = CR_CLOCK_START_CS + tick * 20
-  total_seconds = floor(total_cs / 100)
-  globals.CR_CLOCK_HOURS   = floor(total_seconds / 3600) % 24
-  remaining_seconds        = total_seconds % 3600
-  globals.CR_CLOCK_MINUTES = floor(remaining_seconds / 60)
-  globals.CR_CLOCK_SECONDS = remaining_seconds % 60
-  globals.CR_CLOCK_TENTHS  = floor((total_cs % 100) / 10)
+  sTot  = cr_idiv(total_cs, 100)
+  csRem = total_cs - sTot * 100
+  hTot  = cr_idiv(sTot, 3600)
+  m     = cr_idiv(sTot - hTot * 3600, 60)
+  s     = sTot - hTot * 3600 - m * 60
+  t     = cr_idiv(csRem, 10)
+  globals.CR_CLOCK_HOURS   = cr_mod(hTot, 24)
+  globals.CR_CLOCK_MINUTES = m
+  globals.CR_CLOCK_SECONDS = s
+  globals.CR_CLOCK_TENTHS  = t
 end function
 
 cr_clock_tick = function(tick)
   if tick <= globals.CR_LAST_CLOCK_TICK then return
-
-  ticks_elapsed = tick - globals.CR_LAST_CLOCK_TICK
+  dt_ticks = tick - globals.CR_LAST_CLOCK_TICK
   globals.CR_LAST_CLOCK_TICK = tick
 
-  total_new_cs      = ticks_elapsed * 20
-  total_new_seconds = floor(total_new_cs / 100)
-  new_tenths        = floor((total_new_cs % 100) / 10)
+  add_cs = dt_ticks * 20
+  add_s  = cr_idiv(add_cs, 100)
+  add_t  = cr_idiv(add_cs - add_s * 100, 10)
 
-  globals.CR_CLOCK_TENTHS = globals.CR_CLOCK_TENTHS + new_tenths
-  if globals.CR_CLOCK_TENTHS >= 10 then
-    extra_seconds = floor(globals.CR_CLOCK_TENTHS / 10)
-    globals.CR_CLOCK_TENTHS = globals.CR_CLOCK_TENTHS % 10
-    total_new_seconds = total_new_seconds + extra_seconds
+  // tenths → seconds carry
+  t = globals.CR_CLOCK_TENTHS + add_t
+  if t >= 10 then
+    add_s = add_s + cr_idiv(t, 10)
+    t = cr_mod(t, 10)
   end if
+  globals.CR_CLOCK_TENTHS = t
 
-  globals.CR_CLOCK_SECONDS = globals.CR_CLOCK_SECONDS + total_new_seconds
-  if globals.CR_CLOCK_SECONDS >= 60 then
-    extra_minutes = floor(globals.CR_CLOCK_SECONDS / 60)
-    globals.CR_CLOCK_SECONDS = globals.CR_CLOCK_SECONDS % 60
-    globals.CR_CLOCK_MINUTES = globals.CR_CLOCK_MINUTES + extra_minutes
+  // seconds → minutes carry
+  s = globals.CR_CLOCK_SECONDS + add_s
+  if s >= 60 then
+    add_m = cr_idiv(s, 60)
+    s = cr_mod(s, 60)
+    globals.CR_CLOCK_MINUTES = globals.CR_CLOCK_MINUTES + add_m
   end if
+  globals.CR_CLOCK_SECONDS = s
 
+  // minutes → hours carry
   if globals.CR_CLOCK_MINUTES >= 60 then
-    extra_hours = floor(globals.CR_CLOCK_MINUTES / 60)
-    globals.CR_CLOCK_MINUTES = globals.CR_CLOCK_MINUTES % 60
-    globals.CR_CLOCK_HOURS   = (globals.CR_CLOCK_HOURS + extra_hours) % 24
+    add_h = cr_idiv(globals.CR_CLOCK_MINUTES, 60)
+    globals.CR_CLOCK_MINUTES = cr_mod(globals.CR_CLOCK_MINUTES, 60)
+    globals.CR_CLOCK_HOURS = cr_mod(globals.CR_CLOCK_HOURS + add_h, 24)
   end if
 end function
 
@@ -2189,9 +2196,9 @@ end function
 help_crawl = "start Crawl"
 help_crawl_long = "Arrows/numpad. H/V=5, diag=7. '5'=wait5, '.'=wait1. Use '>'/'<' on stairs (cost 10). Floors like F1A. Death deletes save; Q saves and quits."
 
-// --- standalone entry point ---
-if not globals.hasIndex("__CrawlStandaloneRun") then
-  globals["__CrawlStandaloneRun"] = 1
-  bgcolor(15,10,5) // dark brown
+// --- optional runner (off by default) ---
+if globals.hasIndex("__RunCrawlNow") and globals["__RunCrawlNow"] then
+  bgcolor(15,10,5)
   verb_crawl("")
 end if
+

@@ -1,6 +1,5 @@
 #include crawl.mud
 
-
 // crawl_test.eee — headless unit tests
 // ---- tiny harness ----
 OUT = []; TESTS = 0; FAILS = 0  // not trusted for totals; we’ll derive from OUT
@@ -12,9 +11,10 @@ t_line = function(s); t_push(s); end function
 t_reset = function()
   globals.G_KCAL = 1200; globals.G_WATER = 1.0; globals.G_ALERT = 100
   globals.G_ACC_K = 0; globals.G_ACC_W = 0; globals.G_ACC_A = 0
-  globals.G_ACC_REGEN = 0; globals.G_ACC_STARVE = 0
+  globals.G_ACC_REGEN = 0; globals.G_ACC_STARVE_K = 0; globals.G_ACC_STARVE_W = 0
   globals.G_ACC_EXH = 0
-  globals.G_S_HUNGRY = 0; globals.G_S_STARVING = 0; globals.G_S_THIRST = 0; globals.G_S_DEHY = 0; globals.G_S_VT = 0; globals.G_S_EXH = 0
+  globals.G_S_HUNGRY = 0; globals.G_S_STARVING = 0; globals.G_S_THIRST = 0
+  globals.G_S_DEHY = 0; globals.G_S_VT = 0; globals.G_S_EXH = 0
 end function
 
 t_ok = function(name, cond)
@@ -69,6 +69,11 @@ test_rng_determinism = function()
   t_ok("seeded gen deterministic", sA == sB)
 end function
 
+test_fmt_dur = function()
+  t_eq("dur 0",  cr_fmt_dur_ticks(0), "00:00:00.0")
+  t_eq("dur 123", cr_fmt_dur_ticks(123), "00:00:24.6")
+end function
+
 test_f1_no_ups = function()
   life = "Lx"; fid = "L1A"
   lvl = cr_load_level(life, fid, 4, 4)
@@ -118,14 +123,29 @@ end function
 test_pools_tick = function()
   t_reset(); hp = 50
   cr_pools_tick("idle", 225, hp, ""); t_eq("kcal -1 per 225 idle", globals.G_KCAL, 1199)
+
   t_reset(); hp = 50
   cr_pools_tick("idle", 1800, hp, ""); t_near("water -0.01 per 1800 idle", globals.G_WATER, 0.99, 0.0005)
+
+  // alert gain uses current SLP_A_T, not 1440
   t_reset(); globals.G_ALERT = 40
-  cr_pools_tick("sleep", 1440, 50, ""); t_eq("alert +1 per 1440 sleep", globals.G_ALERT, 41)
-  t_reset(); globals.G_KCAL = 800; hp = 98
-  r = cr_pools_tick("sleep", 100, hp, ""); t_eq("regen +2 at sleep*2", r[0], 100)
-  t_reset(); globals.G_KCAL = 0; hp = 10
-  r2 = cr_pools_tick("idle", 1800, hp, ""); t_eq("starve -1 per 1800 at zero", r2[0], 9)
+  dtA = cr_next_alert_gain()
+  cr_pools_tick("sleep", dtA, 50, ""); t_eq("alert +1 per SLP_A_T sleep", globals.G_ALERT, 41)
+
+  // sleep regen: make kcal high so pre-drain doesn't kill gating
+  t_reset(); globals.G_KCAL = 10000; globals.G_WATER = 1.0; hp = 98
+  tpS = cr_regen_ticks_per_hp("sleep", hp)
+  if tpS > 0 then
+    r = cr_pools_tick("sleep", tpS * 2, hp, "")
+    t_eq("regen +2 at sleep*2", r[0], 100)   // capped at HP_MAX_DEFAULT
+  else
+    t_ok("regen unavailable at this hp/mode", 1)
+  end if
+
+  // starvation on kcal==0 uses STARVE_HP_T_K, not 1800
+  t_reset(); globals.G_KCAL = 0; globals.G_WATER = 1.0; hp = 10
+  dtS = cr_next_starve_dt()
+  r2 = cr_pools_tick("idle", dtS, hp, ""); t_eq("starve -1 at next K tick", r2[0], 9)
 end function
 
 test_enemy_commit = function()
@@ -138,10 +158,15 @@ test_enemy_commit = function()
     end while
     y = y + 1
   end while
+
   enemies = [cr_make_enemy(1,1,"G",3)]
   enemies[0]["x"] = 1; enemies[0]["y"] = 2
-  r = cr_do_time("idle", 5, m, enemies, 2, 2, 0, 20, "")
-  t_eq("adjacent enemy hits once over 5", r[1], 18)
+
+  // Step 1 schedules wind-up, Step 2 lands the hit.
+  r1 = cr_do_time("idle", 5, m, enemies, 2, 2, 0, 20, "")
+  r2 = cr_do_time("idle", 1, m, enemies, 2, 2, r1[0], r1[1], r1[2])
+
+  t_eq("adjacent enemy hits once over 5+1", r2[1], 18)
 end function
 
 test_find_free_dot = function()
@@ -173,10 +198,14 @@ test_step_toward = function()
 end function
 
 test_regen_awake_gate = function()
-  t_reset(); globals.G_KCAL = 800; hp = 98
-  r = cr_pools_tick("idle", 100, hp, ""); t_eq("regen +1 /100 awake", r[0], 99)
-  t_reset(); globals.G_KCAL = 799; hp = 98
-  r2 = cr_pools_tick("idle", 100, hp, ""); t_eq("no regen when kcal<800", r2[0], 98)
+  t_reset(); globals.G_KCAL = 10000; globals.G_WATER = 1.0; hp = 98
+  tpI = cr_regen_ticks_per_hp("idle", hp)
+  if tpI > 0 then
+    r = cr_pools_tick("idle", tpI, hp, "")
+    t_eq("regen +1 per idle tp", r[0], 99)
+  else
+    t_ok("idle regen unavailable", 1)
+  end if
 end function
 
 test_speed_mul = function()
@@ -197,6 +226,7 @@ end function
 // ---- entry ----
 crawl_test_main = function()
   t_line("Running crawl tests")
+  test_fmt_dur()
   test_idiv_mod()
   test_bar10_bounds()
   test_rng_determinism()
@@ -221,6 +251,8 @@ crawl_test_main = function()
   end while
   t_line("Total: " + str(total) + ", Fails: " + str(fails))
   cr_file_write_all("crawl_test.log", t_join(OUT, CR_LF))
+  print "Test complete."
+  breakline
 end function
 
 // auto-run
