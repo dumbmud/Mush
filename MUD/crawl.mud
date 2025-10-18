@@ -37,6 +37,9 @@ LVL_H = 48
 
 CR_SAVE_PATH = "crawl.save"
 
+STAIR_CLAMP = 6
+BRANCH_MERGE_PCT = 50   // bonus stairs prefer merging on branches
+A_BONUS_MERGE_PCT = 30  // lower merge bias on A
 
 // ---------- PLC file I/O (overwrite whole file) ----------
 cr_file_write_all = function(p, txt)
@@ -411,6 +414,51 @@ cr_bar10 = function(cur, maxv)
   if n < 0 then n = 0
   return "[" + cr_repeat("#", n) + cr_repeat(".", 10 - n) + "]"
 end function
+
+cr_var_code = function(v); return v[0:1].code; end function
+
+cr_neighbors = function(v)
+  c = cr_var_code(v)
+  L = []
+  if c > "A".code then L.push(char(c - 1))
+  L.push(char(c))
+  if c < "Z".code then L.push(char(c + 1))
+  return L
+end function
+
+// remove 'A' if source is farther than B
+cr_neighbors_filtered = function(sv)
+  n = cr_neighbors(sv)
+  if sv != "A" and cr_var_code(sv) - "A".code > 1 then
+    f = []
+    i = 0
+    while i < n.len
+      if n[i] != "A" then f.push(n[i])
+      i = i + 1
+    end while
+    return f
+  end if
+  return n
+end function
+
+// pick same/±1-variant; optionally merge into existing variants on target floor
+cr_pick_variant_neighbor = function(used, floorN, sv, mergePct, seedBase)
+  n = cr_neighbors_filtered(sv)
+  ex = []; fr = []
+  i = 0
+  while i < n.len
+    v = n[i]
+    if cr_used_has(used, floorN, v) then ex.push(v) else fr.push(v)
+    i = i + 1
+  end while
+  cr_srand(seedBase)
+  r = cr_rand(100)
+  if ex.len > 0 and r < mergePct then return ex[cr_rand(ex.len)]
+  if fr.len > 0 then return fr[cr_rand(fr.len)]
+  if ex.len > 0 then return ex[cr_rand(ex.len)]
+  return sv
+end function
+
 
 // ===== survival core =====
 SPT = 0.20 // not used by PLC timing; for reference
@@ -1784,10 +1832,19 @@ cr_alloc_down = function(links, used, life, srcFid, idx)
   p = cr_parse_fid(srcFid); sf = p[0]; sv = p[1]
   df = sf + 1
   dstVar = null
+
+  // idx 0 = spine continuity
   if idx == 0 then
     if not cr_used_has(used, df, sv) then dstVar = sv
   end if
-  if dstVar == null then dstVar = cr_used_next_free(used, df)
+
+  if dstVar == null then
+    mergePct = BRANCH_MERGE_PCT
+    if sv == "A" then mergePct = A_BONUS_MERGE_PCT
+    seedBase = cr_seed_for(life, srcFid) + 90000 + idx * 31
+    dstVar = cr_pick_variant_neighbor(used, df, sv, mergePct, seedBase)
+  end if
+
   dstFid = cr_fid(df, dstVar)
   cr_links_set_pair(links, srcFid, "down", idx, dstFid)
   cr_used_add(used, df, dstVar)
@@ -1799,10 +1856,18 @@ cr_alloc_up = function(links, used, life, srcFid, idx)
   if sf <= 1 then return null
   df = sf - 1
   dstVar = null
+
   if idx == 0 then
     if not cr_used_has(used, df, sv) then dstVar = sv
   end if
-  if dstVar == null then dstVar = cr_used_next_free(used, df)
+
+  if dstVar == null then
+    mergePct = BRANCH_MERGE_PCT
+    if sv == "A" then mergePct = A_BONUS_MERGE_PCT
+    seedBase = cr_seed_for(life, srcFid) + 91000 + idx * 37
+    dstVar = cr_pick_variant_neighbor(used, df, sv, mergePct, seedBase)
+  end if
+
   dstFid = cr_fid(df, dstVar)
   cr_links_set_pair(links, srcFid, "up", idx, dstFid)
   cr_used_add(used, df, dstVar)
